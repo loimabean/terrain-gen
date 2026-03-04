@@ -1,0 +1,3 @@
+# Uncomment below to get intellisense for wasm32
+# [build]
+# target = "wasm32-unknown-unknown"

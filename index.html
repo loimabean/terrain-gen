@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+    <head>
+        <meta charset="UTF-8" />
+        <meta http-equiv="X-UA-Compatible" content="IE=edge" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <title>Learn WGPU</title>
+        <style>
+            * {
+                padding: 0;
+                margin: 0;
+                /* Get canvas to be truly fullscreen */
+                height: 100%;
+                overflow: hidden;
+            }
+            canvas {
+                background-color: black;
+                width: 100%;
+                height: 100%;
+            }
+        </style>
+        <script type="module">
+            import init from "./pkg/cs677_final_project.js";
+            init().then(() => {
+                console.log("WASM Loaded");
+            });
+        </script>
+    </head>
+
+    <body id="wasm-example">
+        <canvas id="canvas"></canvas>
+    </body>
+</html>

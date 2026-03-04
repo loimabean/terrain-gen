@@ -1,0 +1,39 @@
+[profile.release]
+strip = true
+
+[package]
+name = "cs677-final-project"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+description = "Procedural terrain generation & rendering using wgpu for Stevens' CS 677 Parallel Programming for Many-Core Processors"
+
+[dependencies]
+anyhow = "1.0.102"
+env_logger = "0.11.9"
+log = "0.4.29"
+pollster = "0.4.0"
+wgpu = "28.0.0"
+winit = "0.30.13"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+console_error_panic_hook = "0.1.6"
+console_log = "1.0"
+wgpu = { version = "28.0", features = ["webgl"]}
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4.30"
+web-sys = { version = "0.3", features = [
+   "Document",
+   "Window",
+   "Element",
+]}
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[profile.release.build-override]
+opt-level = 3
+
+# https://github.com/rust-lang/rust/issues/141048
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = ["-O","--enable-bulk-memory", "--enable-nontrapping-float-to-int"]
