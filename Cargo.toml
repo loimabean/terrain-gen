@@ -8,6 +8,7 @@ description = "Procedural terrain generation & rendering using wgpu for Stevens'
 
 [profile.release]
 strip = true
+lto = true
 build-override = { opt-level = 3 }
 
 # https://github.com/rust-lang/rust/issues/141048
