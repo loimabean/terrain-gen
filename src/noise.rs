@@ -73,6 +73,18 @@ pub fn perlin2d(x: f32, y: f32, seed: u32) -> f32 {
     lerp(lerp(n00, n10, u), lerp(n01, n11, u), v)
 }
 
+pub fn generate_perlin_grid(width: u32, height: u32, scale: f32, seed: u32) -> Vec<f32> {
+    let mut grid = Vec::with_capacity((width * height) as usize);
+    for y in 0..height {
+        for x in 0..width {
+            let nx = x as f32 * scale;
+            let ny = y as f32 * scale;
+            grid.push(perlin2d(nx, ny, seed));
+        }
+    }
+    grid
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
