@@ -1,7 +1,8 @@
+pub mod camera;
 pub mod noise;
 mod texture;
 
-use cgmath::{InnerSpace, SquareMatrix};
+use camera::{Camera, CameraController, CameraUniform, camera_for_grid};
 use std::sync::Arc;
 use wgpu::util::DeviceExt;
 use winit::{
@@ -31,127 +32,6 @@ impl Vertex {
             array_stride: std::mem::size_of::<Vertex>() as wgpu::BufferAddress,
             step_mode: wgpu::VertexStepMode::Vertex,
             attributes: &Self::ATTRS,
-        }
-    }
-}
-
-struct Camera {
-    eye: cgmath::Point3<f32>,
-    target: cgmath::Point3<f32>,
-    up: cgmath::Vector3<f32>,
-    aspect: f32,
-    fovy: f32,
-    znear: f32,
-    zfar: f32,
-}
-
-impl Camera {
-    fn build_view_projection_matrix(&self) -> cgmath::Matrix4<f32> {
-        let view = cgmath::Matrix4::look_at_rh(self.eye, self.target, self.up);
-        let proj = cgmath::perspective(cgmath::Deg(self.fovy), self.aspect, self.znear, self.zfar);
-        proj * view
-    }
-}
-
-#[repr(C)]
-#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-struct CameraUniform {
-    view_proj: [[f32; 4]; 4],
-}
-
-impl CameraUniform {
-    fn new() -> Self {
-        Self {
-            view_proj: cgmath::Matrix4::identity().into(),
-        }
-    }
-
-    fn update_view_proj(&mut self, camera: &Camera) {
-        self.view_proj = (OPENGL_TO_WGPU_MATRIX * camera.build_view_projection_matrix()).into();
-    }
-}
-
-struct CameraController {
-    speed: f32,
-    is_up_pressed: bool,
-    is_down_pressed: bool,
-    is_forward_pressed: bool,
-    is_backward_pressed: bool,
-    is_left_pressed: bool,
-    is_right_pressed: bool,
-}
-
-impl CameraController {
-    fn new(speed: f32) -> Self {
-        Self {
-            speed,
-            is_up_pressed: false,
-            is_down_pressed: false,
-            is_forward_pressed: false,
-            is_backward_pressed: false,
-            is_left_pressed: false,
-            is_right_pressed: false,
-        }
-    }
-
-    fn handle_key(&mut self, key: KeyCode, is_pressed: bool) -> bool {
-        match key {
-            KeyCode::Space => {
-                self.is_up_pressed = is_pressed;
-                true
-            }
-            KeyCode::ShiftLeft => {
-                self.is_down_pressed = is_pressed;
-                true
-            }
-            KeyCode::KeyW | KeyCode::ArrowUp => {
-                self.is_forward_pressed = is_pressed;
-                true
-            }
-            KeyCode::KeyA | KeyCode::ArrowLeft => {
-                self.is_left_pressed = is_pressed;
-                true
-            }
-            KeyCode::KeyS | KeyCode::ArrowDown => {
-                self.is_backward_pressed = is_pressed;
-                true
-            }
-            KeyCode::KeyD | KeyCode::ArrowRight => {
-                self.is_right_pressed = is_pressed;
-                true
-            }
-            _ => false,
-        }
-    }
-
-    fn update_camera(&self, camera: &mut Camera) {
-        let forward = camera.target - camera.eye;
-        let forward_norm = forward.normalize();
-        let forward_mag = forward.magnitude();
-
-        if self.is_forward_pressed && forward_mag > self.speed {
-            camera.eye += forward_norm * self.speed;
-        }
-        if self.is_backward_pressed {
-            camera.eye -= forward_norm * self.speed;
-        }
-
-        let right = forward_norm.cross(camera.up);
-        let forward = camera.target - camera.eye;
-        let forward_mag = forward.magnitude();
-
-        if self.is_right_pressed {
-            camera.eye = camera.target - (forward + right * self.speed).normalize() * forward_mag;
-        }
-        if self.is_left_pressed {
-            camera.eye = camera.target - (forward - right * self.speed).normalize() * forward_mag;
-        }
-
-        if self.is_up_pressed {
-            camera.eye += camera.up * self.speed;
-        }
-        if self.is_down_pressed {
-            camera.eye -= camera.up * self.speed;
         }
     }
 }
@@ -187,13 +67,6 @@ fn create_plane_mesh(width: u32, height: u32) -> (Vec<Vertex>, Vec<u32>) {
 
     (vertices, indices)
 }
-
-pub const OPENGL_TO_WGPU_MATRIX: cgmath::Matrix4<f32> = cgmath::Matrix4::from_cols(
-    cgmath::Vector4::new(1.0, 0.0, 0.0, 0.0),
-    cgmath::Vector4::new(0.0, 1.0, 0.0, 0.0),
-    cgmath::Vector4::new(0.0, 0.0, 0.5, 0.0),
-    cgmath::Vector4::new(0.0, 0.0, 0.5, 1.0),
-);
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -294,12 +167,19 @@ pub struct State {
     compute_uniform_buffer: wgpu::Buffer,
     compute_output_buffer: wgpu::Buffer,
     compute_read_buffer: wgpu::Buffer,
-    #[allow(dead_code)] // kept alive by compute_lut_bind_group
     gradient_lut_buffer: wgpu::Buffer,
+
+    // stored layouts needed to rebuild bind groups on grid resize
+    compute_bind_group_layout: wgpu::BindGroupLayout,
+    compute_lut_bind_group_layout: wgpu::BindGroupLayout,
+    terrain_bind_group_layout: wgpu::BindGroupLayout,
 
     // render pipeline that reads the compute heightmap (pipelines 2 & 3)
     render_pipeline: wgpu::RenderPipeline,
     terrain_bind_group: wgpu::BindGroup,
+
+    // deferred grid resize
+    pending_grid_size: Option<(u32, u32)>,
 
     // pipeline 4: vertex shader inline noise
     vertex_gen_pipeline: wgpu::RenderPipeline,
@@ -324,6 +204,9 @@ pub struct State {
     /// WASM only: async verify writes its result here; `update()` polls it each frame.
     #[cfg(target_arch = "wasm32")]
     verify_result_slot: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+
+    // last known cursor position (used by handle_cursor_moved; look deltas come from DeviceEvent)
+    cursor_pos: Option<winit::dpi::PhysicalPosition<f64>>,
 
     // winit
     window: Arc<Window>,
@@ -394,16 +277,15 @@ impl State {
             desired_maximum_frame_latency: 2,
         };
 
-        let camera = Camera {
-            eye: (512.0, 300.0, 900.0).into(),
-            target: (512.0, 0.0, 512.0).into(),
-            up: cgmath::Vector3::unit_y(),
-            aspect: config.width as f32 / config.height as f32,
-            fovy: 45.0,
-            znear: 0.1,
-            zfar: 2000.0,
-        };
-        let camera_controller = CameraController::new(4.0);
+        let terrain_options_tmp = TerrainOptions::default();
+        let mut camera = camera_for_grid(
+            terrain_options_tmp.width,
+            terrain_options_tmp.height,
+            config.width as f32 / config.height as f32,
+        );
+        // aspect is set again below from config, but set it here too for clarity
+        camera.aspect = config.width as f32 / config.height as f32;
+        let camera_controller = CameraController::new(200.0);
         let mut camera_uniform = CameraUniform::new();
         camera_uniform.update_view_proj(&camera);
 
@@ -435,7 +317,7 @@ impl State {
             label: Some("camera_bind_group"),
         });
 
-        let terrain_options = TerrainOptions::default();
+        let terrain_options = terrain_options_tmp;
         let (vertices, indices) = create_plane_mesh(terrain_options.width, terrain_options.height);
 
         let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -865,8 +747,12 @@ impl State {
             compute_output_buffer,
             compute_read_buffer,
             gradient_lut_buffer,
+            compute_bind_group_layout,
+            compute_lut_bind_group_layout,
+            terrain_bind_group_layout,
             render_pipeline,
             terrain_bind_group,
+            pending_grid_size: None,
             vertex_gen_pipeline,
             vertex_gen_bind_group,
             egui_ctx,
@@ -880,6 +766,7 @@ impl State {
             verify_result: String::new(),
             #[cfg(target_arch = "wasm32")]
             verify_result_slot: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            cursor_pos: None,
             window,
         })
     }
@@ -894,6 +781,99 @@ impl State {
             self.depth_texture =
                 texture::Texture::create_depth_texture(&self.device, &self.config, "depth_texture");
         }
+    }
+
+    fn rebuild_grid(&mut self, new_width: u32, new_height: u32) {
+        self.terrain_options.width = new_width;
+        self.terrain_options.height = new_height;
+
+        let (vertices, indices) = create_plane_mesh(new_width, new_height);
+        self.vertex_buffer =
+            self.device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("Vertex Buffer"),
+                    contents: bytemuck::cast_slice(&vertices),
+                    usage: wgpu::BufferUsages::VERTEX,
+                });
+        self.index_buffer =
+            self.device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("Index Buffer"),
+                    contents: bytemuck::cast_slice(&indices),
+                    usage: wgpu::BufferUsages::INDEX,
+                });
+        self.num_indices = indices.len() as u32;
+
+        let buffer_size = (new_width * new_height * std::mem::size_of::<[f32; 4]>() as u32)
+            as wgpu::BufferAddress;
+        self.compute_output_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Compute Output Buffer"),
+            size: buffer_size,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        self.compute_read_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Compute Read Buffer"),
+            size: buffer_size,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+
+        self.compute_bind_group =
+            self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("Compute Bind Group"),
+                layout: &self.compute_bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: self.compute_uniform_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: self.compute_output_buffer.as_entire_binding(),
+                    },
+                ],
+            });
+
+        self.compute_lut_bind_group =
+            self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("Compute LUT Bind Group"),
+                layout: &self.compute_lut_bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: self.compute_uniform_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: self.compute_output_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: self.gradient_lut_buffer.as_entire_binding(),
+                    },
+                ],
+            });
+
+        self.terrain_bind_group =
+            self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                layout: &self.terrain_bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: self.compute_output_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: self.compute_uniform_buffer.as_entire_binding(),
+                    },
+                ],
+                label: Some("terrain_bind_group"),
+            });
+
+        // recenter the camera on the new grid
+        let aspect = self.camera.aspect;
+        self.camera = camera_for_grid(new_width, new_height, aspect);
     }
 
     fn handle_key(&mut self, event_loop: &ActiveEventLoop, code: KeyCode, is_pressed: bool) {
@@ -942,6 +922,46 @@ impl State {
         self.egui_winit_state
             .on_window_event(&self.window, event)
             .consumed
+    }
+
+    fn set_mouse_grab(&self, grab: bool) {
+        use winit::window::CursorGrabMode;
+        if grab {
+            // locked is ideal, confined is a fallback
+            let _ = self
+                .window
+                .set_cursor_grab(CursorGrabMode::Locked)
+                .or_else(|_| self.window.set_cursor_grab(CursorGrabMode::Confined));
+            self.window.set_cursor_visible(false);
+        } else {
+            let _ = self.window.set_cursor_grab(CursorGrabMode::None);
+            self.window.set_cursor_visible(true);
+        }
+    }
+
+    fn handle_mouse_input(&mut self, button: MouseButton, pressed: bool) {
+        if button == MouseButton::Right {
+            self.camera_controller.mouse_look_active = pressed;
+            self.set_mouse_grab(pressed);
+        }
+    }
+
+    fn handle_mouse_wheel(&mut self, delta: MouseScrollDelta) {
+        self.camera_controller.scroll += match delta {
+            MouseScrollDelta::LineDelta(_, y) => y,
+            MouseScrollDelta::PixelDelta(pos) => pos.y as f32 * 0.01,
+        };
+    }
+
+    fn handle_cursor_moved(&mut self, pos: winit::dpi::PhysicalPosition<f64>) {
+        self.cursor_pos = Some(pos);
+    }
+
+    fn handle_mouse_motion(&mut self, dx: f64, dy: f64) {
+        if self.camera_controller.mouse_look_active {
+            self.camera_controller.rotate_horizontal += dx as f32;
+            self.camera_controller.rotate_vertical += dy as f32;
+        }
     }
 
     // compute dispatch
@@ -1088,7 +1108,7 @@ impl State {
         }
 
         // camera
-        self.camera_controller.update_camera(&mut self.camera);
+        self.camera_controller.update_camera(&mut self.camera, dt);
         self.camera_uniform.update_view_proj(&self.camera);
         self.queue.write_buffer(
             &self.camera_buffer,
@@ -1112,6 +1132,7 @@ impl State {
             let options = &mut self.terrain_options;
             let mode = &mut self.pipeline_mode;
             let verify_req = &mut self.verify_requested;
+            let grid_size_req = &mut self.pending_grid_size;
 
             let fps = self.fps;
             let frame_time_ms = self.frame_time_ms;
@@ -1193,14 +1214,24 @@ impl State {
 
                         ui.separator();
 
-                        // TODO: edit grid size
-                        ui.label(
-                            egui::RichText::new(format!(
-                                "Grid: {}×{}",
-                                options.width, options.height
-                            ))
-                            .weak(),
-                        );
+                        // grid size selector
+                        ui.label(egui::RichText::new("Grid Size").strong());
+                        const GRID_SIZES: &[u32] = &[64, 128, 256, 512, 1024, 2048];
+                        let mut selected = options.width;
+                        egui::ComboBox::from_id_salt("grid_size")
+                            .selected_text(format!("{}x{}", selected, selected))
+                            .show_ui(ui, |ui| {
+                                for &s in GRID_SIZES {
+                                    ui.selectable_value(
+                                        &mut selected,
+                                        s,
+                                        format!("{}x{}", s, s),
+                                    );
+                                }
+                            });
+                        if selected != options.width {
+                            *grid_size_req = Some((selected, selected));
+                        }
 
                         ui.separator();
 
@@ -1229,8 +1260,10 @@ impl State {
 
                         // controls
                         ui.label(egui::RichText::new("Controls").strong());
-                        ui.label(egui::RichText::new("WASD/Arrows - move camera").monospace());
-                        ui.label(egui::RichText::new("Space/Shift - ascend/descend").monospace());
+                        ui.label(egui::RichText::new("WASD/Arrows - move").monospace());
+                        ui.label(egui::RichText::new("Space/Shift - up/down").monospace());
+                        ui.label(egui::RichText::new("RMB + drag  - look").monospace());
+                        ui.label(egui::RichText::new("Scroll      - zoom").monospace());
                         ui.label(egui::RichText::new("O           - cycle pipeline").monospace());
                         ui.label(egui::RichText::new("V           - verify GPU").monospace());
                         ui.label(egui::RichText::new("F11/F       - fullscreen").monospace());
@@ -1238,6 +1271,11 @@ impl State {
                     });
             })
         };
+
+        // handle deferred grid resize before writing terrain_options to GPU
+        if let Some((w, h)) = self.pending_grid_size.take() {
+            self.rebuild_grid(w, h);
+        }
 
         // cheap enough to write updated params to GPU uniform buffer every frame
         self.queue.write_buffer(
@@ -1520,7 +1558,29 @@ impl ApplicationHandler<State> for App {
             } if !egui_consumed => {
                 state.handle_key(event_loop, code, key_state.is_pressed());
             }
+            WindowEvent::MouseInput { state: btn_state, button, .. } => {
+                state.handle_mouse_input(button, btn_state.is_pressed());
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
+                state.handle_mouse_wheel(delta);
+            }
+            WindowEvent::CursorMoved { position, .. } => {
+                state.handle_cursor_moved(position);
+            }
             _ => {}
+        }
+    }
+
+    fn device_event(
+        &mut self,
+        _event_loop: &ActiveEventLoop,
+        _device_id: winit::event::DeviceId,
+        event: DeviceEvent,
+    ) {
+        if let Some(state) = &mut self.state {
+            if let DeviceEvent::MouseMotion { delta: (dx, dy) } = event {
+                state.handle_mouse_motion(dx, dy);
+            }
         }
     }
 }
