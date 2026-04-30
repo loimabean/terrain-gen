@@ -21,12 +21,10 @@ use winit::platform::web::EventLoopExtWebSys;
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct Vertex {
     position: [f32; 3],
-    tex_coords: [f32; 2],
 }
 
 impl Vertex {
-    const ATTRS: [wgpu::VertexAttribute; 2] =
-        wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x2];
+    const ATTRS: [wgpu::VertexAttribute; 1] = wgpu::vertex_attr_array![0 => Float32x3];
 
     fn desc() -> wgpu::VertexBufferLayout<'static> {
         wgpu::VertexBufferLayout {
@@ -131,8 +129,6 @@ impl CameraController {
         let forward_norm = forward.normalize();
         let forward_mag = forward.magnitude();
 
-        // Prevents glitching when camera gets too close to the
-        // center of the scene.
         if self.is_forward_pressed && forward_mag > self.speed {
             camera.eye += forward_norm * self.speed;
         }
@@ -141,19 +137,21 @@ impl CameraController {
         }
 
         let right = forward_norm.cross(camera.up);
-
-        // Redo radius calc in case the up/ down is pressed.
         let forward = camera.target - camera.eye;
         let forward_mag = forward.magnitude();
 
         if self.is_right_pressed {
-            // Rescale the distance between the target and eye so
-            // that it doesn't change. The eye therefore still
-            // lies on the circle made by the target and eye.
             camera.eye = camera.target - (forward + right * self.speed).normalize() * forward_mag;
         }
         if self.is_left_pressed {
             camera.eye = camera.target - (forward - right * self.speed).normalize() * forward_mag;
+        }
+
+        if self.is_up_pressed {
+            camera.eye += camera.up * self.speed;
+        }
+        if self.is_down_pressed {
+            camera.eye -= camera.up * self.speed;
         }
     }
 }
@@ -166,10 +164,6 @@ fn create_plane_mesh(width: u32, height: u32) -> (Vec<Vertex>, Vec<u32>) {
         for x in 0..width {
             vertices.push(Vertex {
                 position: [x as f32, 0.0, z as f32],
-                tex_coords: [
-                    x as f32 / (width - 1) as f32,
-                    z as f32 / (height - 1) as f32,
-                ],
             });
         }
     }
@@ -229,36 +223,110 @@ impl Default for TerrainOptions {
     }
 }
 
+/// Which terrain generation pipeline is active.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PipelineMode {
+    /// Pipeline 2 - baseline GPU compute shader (one trig call per gradient).
+    ComputeStandard,
+    /// Pipeline 3a - GPU compute with shared workgroup memory caching the 1st-octave gradients.
+    ComputeOptimized,
+    /// Pipeline 3b - GPU compute replacing cos/sin with a 256-entry precomputed LUT.
+    ComputeLut,
+    /// Pipeline 4 - terrain height computed entirely inside the vertex shader; no compute pass.
+    VertexShader,
+}
+
+impl PipelineMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::ComputeStandard => "Compute - Standard",
+            Self::ComputeOptimized => "Compute - Shared Mem",
+            Self::ComputeLut => "Compute - Gradient LUT",
+            Self::VertexShader => "Vertex Shader",
+        }
+    }
+
+    /// Cycle to the next mode.
+    fn next(self) -> Self {
+        match self {
+            Self::ComputeStandard => Self::ComputeOptimized,
+            Self::ComputeOptimized => Self::ComputeLut,
+            Self::ComputeLut => Self::VertexShader,
+            Self::VertexShader => Self::ComputeStandard,
+        }
+    }
+}
+
 pub struct State {
+    // wgpu core
     surface: wgpu::Surface<'static>,
     device: wgpu::Device,
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
     is_surface_configured: bool,
-    render_pipeline: wgpu::RenderPipeline,
+
+    // geometry
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
     num_indices: u32,
-    diffuse_texture: texture::Texture,
-    diffuse_bind_group: wgpu::BindGroup,
+
+    // textures
+    depth_texture: texture::Texture,
+
+    // camera
     camera: Camera,
     camera_controller: CameraController,
     camera_uniform: CameraUniform,
     camera_buffer: wgpu::Buffer,
     camera_bind_group: wgpu::BindGroup,
-    terrain_bind_group: wgpu::BindGroup,
-    depth_texture: texture::Texture,
-    window: Arc<Window>,
 
-    // Terrain configuration
+    // terrain parameters
     pub terrain_options: TerrainOptions,
+    pipeline_mode: PipelineMode,
 
-    // Compute resources
-    compute_pipeline: wgpu::ComputePipeline,
-    compute_bind_group: wgpu::BindGroup,
+    // pipeline 2/3: GPU compute -> heightmap -> render
+    // (pipeline 1 is CPU noise.rs, used only for correctness verification)
+    compute_pipeline: wgpu::ComputePipeline, // standard
+    optimized_compute_pipeline: wgpu::ComputePipeline, // shared-mem
+    lut_compute_pipeline: wgpu::ComputePipeline, // gradient LUT
+    compute_bind_group: wgpu::BindGroup,     // standard + optimized share this
+    compute_lut_bind_group: wgpu::BindGroup, // LUT pipeline
     compute_uniform_buffer: wgpu::Buffer,
     compute_output_buffer: wgpu::Buffer,
     compute_read_buffer: wgpu::Buffer,
+    #[allow(dead_code)] // kept alive by compute_lut_bind_group
+    gradient_lut_buffer: wgpu::Buffer,
+
+    // render pipeline that reads the compute heightmap (pipelines 2 & 3)
+    render_pipeline: wgpu::RenderPipeline,
+    terrain_bind_group: wgpu::BindGroup,
+
+    // pipeline 4: vertex shader inline noise
+    vertex_gen_pipeline: wgpu::RenderPipeline,
+    vertex_gen_bind_group: wgpu::BindGroup,
+
+    // egui
+    egui_ctx: egui::Context,
+    egui_renderer: egui_wgpu::Renderer,
+    egui_winit_state: egui_winit::State,
+
+    // performance counters
+    frame_timer: web_time::Instant,
+    frame_time_ms: f32,
+    fps: f32,
+    /// Ring buffer of the last 256 per-frame durations (seconds) for a smoothed average.
+    fps_history: std::collections::VecDeque<f32>,
+
+    // verification
+    verify_requested: bool,
+    /// Formatted summary of the last verification run; shown in the egui panel.
+    verify_result: String,
+    /// WASM only: async verify writes its result here; `update()` polls it each frame.
+    #[cfg(target_arch = "wasm32")]
+    verify_result_slot: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+
+    // winit
+    window: Arc<Window>,
 }
 
 impl State {
@@ -269,7 +337,7 @@ impl State {
             #[cfg(not(target_arch = "wasm32"))]
             backends: wgpu::Backends::PRIMARY,
             #[cfg(target_arch = "wasm32")]
-            backends: wgpu::Backends::all(), // WebGPU!
+            backends: wgpu::Backends::all(),
             flags: Default::default(),
             memory_budget_thresholds: Default::default(),
             backend_options: Default::default(),
@@ -293,11 +361,10 @@ impl State {
                 experimental_features: wgpu::ExperimentalFeatures::disabled(),
                 required_limits: if cfg!(target_arch = "wasm32") {
                     wgpu::Limits {
-                        // Default webgl2 limit is 2048... my monitor is wider than that :(
+                        // Default limit is 2048... my monitor is wider than that :(
                         max_texture_dimension_1d: 4096,
                         max_texture_dimension_2d: 4096,
-                        // This kind of makes things not WebGL compatible... but oh well.
-                        // WebGPU support will be everywhere soon™
+                        // Used to downgrade to Webgl2, but we need more modern capabilities
                         ..wgpu::Limits::downlevel_defaults()
                     }
                 } else {
@@ -309,13 +376,13 @@ impl State {
             .await?;
 
         let surface_caps = surface.get_capabilities(&adapter);
-
         let surface_format = surface_caps
             .formats
             .iter()
             .find(|f| f.is_srgb())
             .copied()
             .unwrap_or(surface_caps.formats[0]);
+
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format: surface_format,
@@ -327,47 +394,6 @@ impl State {
             desired_maximum_frame_latency: 2,
         };
 
-        let diffuse_bytes = include_bytes!("loim.png");
-        let diffuse_texture =
-            texture::Texture::from_bytes(&device, &queue, diffuse_bytes, "loim.png").unwrap();
-
-        let texture_bind_group_layout =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                entries: &[
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 0,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Texture {
-                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                            view_dimension: wgpu::TextureViewDimension::D2,
-                            multisampled: false,
-                        },
-                        count: None,
-                    },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 1,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                        count: None,
-                    },
-                ],
-                label: Some("texture_bind_group_layout"),
-            });
-        let diffuse_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            layout: &texture_bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&diffuse_texture.view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&diffuse_texture.sampler),
-                },
-            ],
-            label: Some("diffuse_bind_group"),
-        });
-
         let camera = Camera {
             eye: (512.0, 300.0, 900.0).into(),
             target: (512.0, 0.0, 512.0).into(),
@@ -378,7 +404,6 @@ impl State {
             zfar: 2000.0,
         };
         let camera_controller = CameraController::new(4.0);
-
         let mut camera_uniform = CameraUniform::new();
         camera_uniform.update_view_proj(&camera);
 
@@ -387,7 +412,6 @@ impl State {
             contents: bytemuck::cast_slice(&[camera_uniform]),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
-
         let camera_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 entries: &[wgpu::BindGroupLayoutEntry {
@@ -412,14 +436,13 @@ impl State {
         });
 
         let terrain_options = TerrainOptions::default();
-
         let (vertices, indices) = create_plane_mesh(terrain_options.width, terrain_options.height);
+
         let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Vertex Buffer"),
             contents: bytemuck::cast_slice(&vertices),
             usage: wgpu::BufferUsages::VERTEX,
         });
-
         let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Index Buffer"),
             contents: bytemuck::cast_slice(&indices),
@@ -427,12 +450,9 @@ impl State {
         });
         let num_indices = indices.len() as u32;
 
-        // compute pipeline
-        let compute_shader = device.create_shader_module(wgpu::include_wgsl!("compute.wgsl"));
-
         let buffer_size = (terrain_options.width
             * terrain_options.height
-            * std::mem::size_of::<cgmath::Vector4<f32>>() as u32)
+            * std::mem::size_of::<[f32; 4]>() as u32)
             as wgpu::BufferAddress;
 
         let compute_output_buffer = device.create_buffer(&wgpu::BufferDescriptor {
@@ -441,20 +461,19 @@ impl State {
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
-
         let compute_read_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Compute Read Buffer"),
             size: buffer_size,
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
-
         let compute_uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Compute Uniform Buffer"),
             contents: bytemuck::cast_slice(&[terrain_options]),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
+        // pipeline 2 & 3 (optimized)
         let compute_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("Compute Bind Group Layout"),
@@ -504,8 +523,9 @@ impl State {
                 immediate_size: 0,
             });
 
+        let compute_shader = device.create_shader_module(wgpu::include_wgsl!("compute.wgsl"));
         let compute_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("Compute Pipeline"),
+            label: Some("Compute Pipeline (Standard)"),
             layout: Some(&compute_pipeline_layout),
             module: &compute_shader,
             entry_point: Some("main"),
@@ -513,10 +533,109 @@ impl State {
             cache: None,
         });
 
+        let optimized_compute_shader =
+            device.create_shader_module(wgpu::include_wgsl!("compute_optimized.wgsl"));
+        let optimized_compute_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("Compute Pipeline (Shared Mem)"),
+                layout: Some(&compute_pipeline_layout),
+                module: &optimized_compute_shader,
+                entry_point: Some("main"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+
+        // pipeline 3 (LUT)
+        // build a 256-entry gradient table: evenly-spaced unit vectors.
+        let gradient_lut_data: Vec<[f32; 2]> = (0u32..256)
+            .map(|i| {
+                let angle = (i as f32 / 256.0) * 2.0 * std::f32::consts::PI;
+                [angle.cos(), angle.sin()]
+            })
+            .collect();
+
+        let gradient_lut_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Gradient LUT Buffer"),
+            contents: bytemuck::cast_slice(&gradient_lut_data),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+
+        let compute_lut_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("Compute LUT Bind Group Layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
+            });
+
+        let compute_lut_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Compute LUT Bind Group"),
+            layout: &compute_lut_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: compute_uniform_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: compute_output_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: gradient_lut_buffer.as_entire_binding(),
+                },
+            ],
+        });
+
+        let lut_compute_shader =
+            device.create_shader_module(wgpu::include_wgsl!("compute_lut.wgsl"));
+        let lut_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("LUT Compute Pipeline Layout"),
+            bind_group_layouts: &[Some(&compute_lut_bind_group_layout)],
+            immediate_size: 0,
+        });
+        let lut_compute_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("Compute Pipeline (LUT)"),
+                layout: Some(&lut_pipeline_layout),
+                module: &lut_compute_shader,
+                entry_point: Some("main"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+
+        // terrain render resources (pipelines 2 & 3)
         let depth_texture =
             texture::Texture::create_depth_texture(&device, &config, "depth_texture");
-
-        let shader = device.create_shader_module(wgpu::include_wgsl!("shader.wgsl"));
 
         let terrain_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -564,13 +683,13 @@ impl State {
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("Render Pipeline Layout"),
                 bind_group_layouts: &[
-                    Some(&texture_bind_group_layout),
-                    Some(&camera_bind_group_layout),
-                    Some(&terrain_bind_group_layout),
+                    Some(&camera_bind_group_layout),  // group 0
+                    Some(&terrain_bind_group_layout), // group 1
                 ],
                 immediate_size: 0,
             });
 
+        let shader = device.create_shader_module(wgpu::include_wgsl!("shader.wgsl"));
         let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("Render Pipeline"),
             layout: Some(&render_pipeline_layout),
@@ -618,32 +737,150 @@ impl State {
             cache: None,
         });
 
+        // pipeline 4 (vertex shader noise)
+        // The vertex gen shader computes the Perlin noise per-vertex, no compute pass
+        // It only needs group 2 binding 1 (TerrainOptions), no heightmap
+        let vertex_gen_terrain_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("vertex_gen_terrain_bind_group_layout"),
+                entries: &[wgpu::BindGroupLayoutEntry {
+                    binding: 1, // matches @group(2) @binding(1) in the shader
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                }],
+            });
+
+        let vertex_gen_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            layout: &vertex_gen_terrain_bind_group_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 1,
+                resource: compute_uniform_buffer.as_entire_binding(),
+            }],
+            label: Some("vertex_gen_bind_group"),
+        });
+
+        let vertex_gen_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("Vertex Gen Pipeline Layout"),
+                bind_group_layouts: &[
+                    Some(&camera_bind_group_layout),             // group 0
+                    Some(&vertex_gen_terrain_bind_group_layout), // group 1
+                ],
+                immediate_size: 0,
+            });
+
+        let vertex_gen_shader =
+            device.create_shader_module(wgpu::include_wgsl!("shader_vertex_gen.wgsl"));
+        let vertex_gen_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Vertex Gen Pipeline"),
+            layout: Some(&vertex_gen_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &vertex_gen_shader,
+                entry_point: Some("vs_main"),
+                buffers: &[Vertex::desc()],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &vertex_gen_shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: config.format,
+                    blend: Some(wgpu::BlendState {
+                        color: wgpu::BlendComponent::REPLACE,
+                        alpha: wgpu::BlendComponent::REPLACE,
+                    }),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: Some(wgpu::Face::Back),
+                polygon_mode: wgpu::PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: texture::Texture::DEPTH_FORMAT,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::Less),
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState {
+                count: 1,
+                mask: !0,
+                alpha_to_coverage_enabled: false,
+            },
+            multiview_mask: None,
+            cache: None,
+        });
+
+        // egui
+        let egui_ctx = egui::Context::default();
+        let egui_winit_state = egui_winit::State::new(
+            egui_ctx.clone(),
+            egui::ViewportId::ROOT,
+            window.as_ref(),
+            Some(window.scale_factor() as f32),
+            None,
+            Some(device.limits().max_texture_dimension_2d as usize),
+        );
+        let egui_renderer = egui_wgpu::Renderer::new(
+            &device,
+            surface_format,
+            egui_wgpu::RendererOptions::default(),
+        );
+
         Ok(Self {
             surface,
             device,
             queue,
             config,
             is_surface_configured: false,
-            render_pipeline,
             vertex_buffer,
             index_buffer,
             num_indices,
-            diffuse_texture,
-            diffuse_bind_group,
+            depth_texture,
             camera,
             camera_controller,
+            camera_uniform,
             camera_buffer,
             camera_bind_group,
-            camera_uniform,
-            terrain_bind_group,
-            depth_texture,
-            window,
             terrain_options,
+            pipeline_mode: PipelineMode::ComputeStandard,
             compute_pipeline,
+            optimized_compute_pipeline,
+            lut_compute_pipeline,
             compute_bind_group,
+            compute_lut_bind_group,
             compute_uniform_buffer,
             compute_output_buffer,
             compute_read_buffer,
+            gradient_lut_buffer,
+            render_pipeline,
+            terrain_bind_group,
+            vertex_gen_pipeline,
+            vertex_gen_bind_group,
+            egui_ctx,
+            egui_renderer,
+            egui_winit_state,
+            frame_timer: web_time::Instant::now(),
+            frame_time_ms: 0.0,
+            fps: 0.0,
+            fps_history: std::collections::VecDeque::with_capacity(256),
+            verify_requested: false,
+            verify_result: String::new(),
+            #[cfg(target_arch = "wasm32")]
+            verify_result_slot: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            window,
         })
     }
 
@@ -653,7 +890,7 @@ impl State {
             self.config.width = width;
             self.config.height = height;
             self.surface.configure(&self.device, &self.config);
-            self.camera.aspect = self.config.width as f32 / self.config.height as f32;
+            self.camera.aspect = width as f32 / height as f32;
             self.depth_texture =
                 texture::Texture::create_depth_texture(&self.device, &self.config, "depth_texture");
         }
@@ -665,17 +902,29 @@ impl State {
             (KeyCode::KeyV, true) => {
                 #[cfg(not(target_arch = "wasm32"))]
                 {
-                    pollster::block_on(self.verify_gpu()).unwrap();
+                    self.verify_result = pollster::block_on(self.verify_gpu())
+                        .unwrap_or_else(|e| format!("Error: {e}"));
                 }
                 #[cfg(target_arch = "wasm32")]
                 {
+                    let slot = self.verify_result_slot.clone();
                     let state = self as *const State;
                     wasm_bindgen_futures::spawn_local(async move {
-                        unsafe { &*state }.verify_gpu().await.unwrap();
+                        let msg = unsafe { &*state }
+                            .verify_gpu()
+                            .await
+                            .unwrap_or_else(|e| format!("Error: {e}"));
+                        if let Ok(mut g) = slot.lock() {
+                            *g = Some(msg);
+                        }
                     });
                 }
             }
-            (KeyCode::F11, true) => match self.window.fullscreen() {
+            (KeyCode::KeyO, true) => {
+                self.pipeline_mode = self.pipeline_mode.next();
+                log::info!("Pipeline: {}", self.pipeline_mode.label());
+            }
+            (KeyCode::F11 | KeyCode::KeyF, true) => match self.window.fullscreen() {
                 None => self
                     .window
                     .set_fullscreen(Some(Fullscreen::Borderless(None))),
@@ -687,17 +936,36 @@ impl State {
         }
     }
 
+    // egui event passthrough
+
+    fn handle_egui_event(&mut self, event: &WindowEvent) -> bool {
+        self.egui_winit_state
+            .on_window_event(&self.window, event)
+            .consumed
+    }
+
+    // compute dispatch
+
     fn run_compute(&self, encoder: &mut wgpu::CommandEncoder) {
+        let (pipeline, bind_group) = match self.pipeline_mode {
+            PipelineMode::ComputeStandard => (&self.compute_pipeline, &self.compute_bind_group),
+            PipelineMode::ComputeOptimized => {
+                (&self.optimized_compute_pipeline, &self.compute_bind_group)
+            }
+            PipelineMode::ComputeLut => (&self.lut_compute_pipeline, &self.compute_lut_bind_group),
+            PipelineMode::VertexShader => return, // terrain generated inline in VS, no compute pass
+        };
+
         let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("Compute Pass"),
             timestamp_writes: None,
         });
-        compute_pass.set_pipeline(&self.compute_pipeline);
-        compute_pass.set_bind_group(0, &self.compute_bind_group, &[]);
+        compute_pass.set_pipeline(pipeline);
+        compute_pass.set_bind_group(0, bind_group, &[]);
 
-        let workgroup_count_x = self.terrain_options.width.div_ceil(16);
-        let workgroup_count_y = self.terrain_options.height.div_ceil(16);
-        compute_pass.dispatch_workgroups(workgroup_count_x, workgroup_count_y, 1);
+        let wg_x = self.terrain_options.width.div_ceil(16);
+        let wg_y = self.terrain_options.height.div_ceil(16);
+        compute_pass.dispatch_workgroups(wg_x, wg_y, 1);
     }
 
     async fn execute_compute(&self) -> anyhow::Result<Vec<[f32; 4]>> {
@@ -711,6 +979,7 @@ impl State {
 
         let buffer_size =
             (self.terrain_options.width * self.terrain_options.height * 16) as wgpu::BufferAddress;
+
         encoder.copy_buffer_to_buffer(
             &self.compute_output_buffer,
             0,
@@ -740,41 +1009,85 @@ impl State {
         }
     }
 
-    pub async fn verify_gpu(&self) -> anyhow::Result<()> {
-        log::info!("Verifying GPU results against CPU baseline (fBm)...");
-        let start_gpu = web_time::Instant::now();
+    pub async fn verify_gpu(&self) -> anyhow::Result<String> {
+        if self.pipeline_mode == PipelineMode::VertexShader {
+            let msg =
+                "N/A in Vertex Shader mode\n(no compute output buffer to compare)".to_string();
+            log::info!("Verification: {msg}");
+            return Ok(msg);
+        }
+
+        let total_samples = self.terrain_options.width * self.terrain_options.height;
+        log::info!(
+            "Verifying {} against CPU baseline [{total_samples} samples]...",
+            self.pipeline_mode.label(),
+        );
+
+        let t_gpu = web_time::Instant::now();
         let gpu_results = self.execute_compute().await?;
-        let gpu_duration = start_gpu.elapsed();
+        let gpu_ms = t_gpu.elapsed().as_secs_f64() * 1000.0;
 
-        let start_cpu = web_time::Instant::now();
+        let t_cpu = web_time::Instant::now();
         let cpu_results = crate::noise::generate_fbm_grid(&self.terrain_options);
-        let cpu_duration = start_cpu.elapsed();
+        let cpu_ms = t_cpu.elapsed().as_secs_f64() * 1000.0;
 
-        log::info!("GPU Time: {:?}", gpu_duration);
-        log::info!("CPU Time: {:?}", cpu_duration);
-
-        let mut diff_count = 0;
+        let mut diff_count = 0u32;
+        let mut diff_lines = String::new();
         for (i, (g, c)) in gpu_results.iter().zip(cpu_results.iter()).enumerate() {
             if (g[0] - c).abs() > 1e-3 {
-                if diff_count < 10 {
+                if diff_count < 5 {
                     let x = i as u32 % self.terrain_options.width;
                     let y = i as u32 / self.terrain_options.width;
-                    log::info!("Difference at ({}, {}): GPU={}, CPU={}", x, y, g[0], c);
+                    diff_lines.push_str(&format!("diff at ({x},{y}) gpu={:.5} cpu={:.5}\n", g[0], c));
+                    log::info!("diff at ({x},{y}): GPU={:.5}  CPU={:.5}", g[0], c);
                 }
                 diff_count += 1;
             }
         }
 
-        if diff_count == 0 {
-            log::info!("SUCCESS: GPU results match CPU baseline!");
+        let verdict = if diff_count == 0 {
+            format!("PASS: all {total_samples} samples match")
         } else {
-            log::info!("FAILURE: {} differences found!", diff_count);
-        }
+            format!("FAIL: {diff_count} / {total_samples} samples differ")
+        };
 
-        Ok(())
+        let summary = format!(
+            "Pipeline: {}\nGPU: {gpu_ms:.2} ms\nCPU: {cpu_ms:.1} ms\n{diff_lines}{verdict}",
+            self.pipeline_mode.label(),
+        );
+        log::info!("{summary}");
+        Ok(summary)
     }
 
     fn update(&mut self) {
+        // frame timing
+        let now = web_time::Instant::now();
+        let dt = now.duration_since(self.frame_timer).as_secs_f32();
+        self.frame_timer = now;
+        self.frame_time_ms = dt * 1000.0;
+
+        // 256-frame average FPS, because the release build runs *really* fast
+        if self.fps_history.len() >= 256 {
+            self.fps_history.pop_front();
+        }
+        if dt > 0.0 {
+            self.fps_history.push_back(1.0 / dt);
+        }
+        self.fps = if self.fps_history.is_empty() {
+            0.0
+        } else {
+            self.fps_history.iter().copied().sum::<f32>() / self.fps_history.len() as f32
+        };
+
+        // WASM: poll the async verification result slot
+        #[cfg(target_arch = "wasm32")]
+        if let Ok(mut slot) = self.verify_result_slot.try_lock() {
+            if let Some(result) = slot.take() {
+                self.verify_result = result;
+            }
+        }
+
+        // camera
         self.camera_controller.update_camera(&mut self.camera);
         self.camera_uniform.update_view_proj(&self.camera);
         self.queue.write_buffer(
@@ -791,6 +1104,172 @@ impl State {
             return Ok(());
         }
 
+        // arc clone to mutate fields
+        let egui_ctx = self.egui_ctx.clone();
+        let raw_input = self.egui_winit_state.take_egui_input(&self.window);
+
+        let ui_output = {
+            let options = &mut self.terrain_options;
+            let mode = &mut self.pipeline_mode;
+            let verify_req = &mut self.verify_requested;
+
+            let fps = self.fps;
+            let frame_time_ms = self.frame_time_ms;
+            let verify_result = &self.verify_result;
+
+            egui_ctx.run_ui(raw_input, |ctx| {
+                egui::Panel::left("terrain_controls")
+                    .min_size(250.0)
+                    .resizable(true)
+                    // TODO: resolve deprecation warning here
+                    .show(ctx, |ui| {
+                        ui.heading("terrain gen!");
+                        ui.separator();
+
+                        // perf
+                        ui.label(egui::RichText::new("Performance").strong());
+                        let fps_color = if fps >= 55.0 {
+                            egui::Color32::from_rgb(100, 220, 100)
+                        } else if fps >= 30.0 {
+                            egui::Color32::from_rgb(220, 180, 50)
+                        } else {
+                            egui::Color32::from_rgb(220, 80, 80)
+                        };
+                        ui.horizontal(|ui| {
+                            ui.label("FPS:");
+                            ui.label(
+                                egui::RichText::new(if fps > 0.0 {
+                                    format!("{fps:.1}")
+                                } else {
+                                    "?".to_string()
+                                })
+                                .color(fps_color)
+                                .strong(),
+                            );
+                            ui.label(
+                                egui::RichText::new(if frame_time_ms > 0.0 {
+                                    format!("({frame_time_ms:.2} ms)")
+                                } else {
+                                    "?".to_string()
+                                })
+                                .weak(),
+                            );
+                        });
+
+                        ui.separator();
+
+                        // pipeline selector
+                        ui.label(egui::RichText::new("Pipeline").strong());
+                        for (m, lbl) in [
+                            (PipelineMode::ComputeStandard, "Compute - Standard"),
+                            (PipelineMode::ComputeOptimized, "Compute - Shared Mem"),
+                            (PipelineMode::ComputeLut, "Compute - Gradient LUT"),
+                            (PipelineMode::VertexShader, "Vertex Shader"),
+                        ] {
+                            ui.radio_value(mode, m, lbl);
+                        }
+
+                        ui.separator();
+
+                        // noise params
+                        ui.label(egui::RichText::new("Noise Parameters").strong());
+                        ui.add(
+                            egui::Slider::new(&mut options.scale, 0.001..=0.05)
+                                .logarithmic(true)
+                                .text("Scale"),
+                        );
+                        ui.add(egui::Slider::new(&mut options.octaves, 1..=16).text("Octaves"));
+                        ui.add(
+                            egui::Slider::new(&mut options.persistence, 0.1..=0.9)
+                                .step_by(0.01)
+                                .text("Persistence"),
+                        );
+                        ui.add(
+                            egui::Slider::new(&mut options.lacunarity, 1.0..=4.0)
+                                .step_by(0.05)
+                                .text("Lacunarity"),
+                        );
+                        ui.add(egui::Slider::new(&mut options.seed, 0..=9999).text("Seed"));
+
+                        ui.separator();
+
+                        // TODO: edit grid size
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "Grid: {}×{}",
+                                options.width, options.height
+                            ))
+                            .weak(),
+                        );
+
+                        ui.separator();
+
+                        // verify gpu vs cpu results
+                        let btn_label = if *mode == PipelineMode::VertexShader {
+                            "Verify (N/A, vertex shader pipeline)"
+                        } else {
+                            "Verify GPU vs CPU"
+                        };
+                        if ui.button(btn_label).clicked() {
+                            *verify_req = true;
+                        }
+
+                        if !verify_result.is_empty() {
+                            ui.separator();
+                            ui.label(egui::RichText::new("Last Verification").strong());
+                            egui::ScrollArea::vertical()
+                                .id_salt("verify_scroll")
+                                .max_height(130.0)
+                                .show(ui, |ui| {
+                                    ui.label(verify_result.as_str());
+                                });
+                        }
+
+                        ui.separator();
+
+                        // controls
+                        ui.label(egui::RichText::new("Controls").strong());
+                        ui.label(egui::RichText::new("WASD/Arrows - move camera").monospace());
+                        ui.label(egui::RichText::new("Space/Shift - ascend/descend").monospace());
+                        ui.label(egui::RichText::new("O           - cycle pipeline").monospace());
+                        ui.label(egui::RichText::new("V           - verify GPU").monospace());
+                        ui.label(egui::RichText::new("F11/F       - fullscreen").monospace());
+                        ui.label(egui::RichText::new("Esc         - quit").monospace());
+                    });
+            })
+        };
+
+        // cheap enough to write updated params to GPU uniform buffer every frame
+        self.queue.write_buffer(
+            &self.compute_uniform_buffer,
+            0,
+            bytemuck::cast_slice(&[self.terrain_options]),
+        );
+
+        // handle deferred verification request (will block!)
+        if self.verify_requested {
+            self.verify_requested = false;
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                self.verify_result =
+                    pollster::block_on(self.verify_gpu()).unwrap_or_else(|e| format!("Error: {e}"));
+            }
+            #[cfg(target_arch = "wasm32")]
+            {
+                let slot = self.verify_result_slot.clone();
+                let state = self as *const State;
+                wasm_bindgen_futures::spawn_local(async move {
+                    let msg = unsafe { &*state }
+                        .verify_gpu()
+                        .await
+                        .unwrap_or_else(|e| format!("Error: {e}"));
+                    if let Ok(mut g) = slot.lock() {
+                        *g = Some(msg);
+                    }
+                });
+            }
+        }
+
         let output = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(surface_texture) => surface_texture,
             wgpu::CurrentSurfaceTexture::Suboptimal(surface_texture) => {
@@ -801,16 +1280,12 @@ impl State {
             }
             wgpu::CurrentSurfaceTexture::Timeout
             | wgpu::CurrentSurfaceTexture::Occluded
-            | wgpu::CurrentSurfaceTexture::Validation => {
-                return Ok(());
-            }
+            | wgpu::CurrentSurfaceTexture::Validation => return Ok(()),
             wgpu::CurrentSurfaceTexture::Outdated => {
                 self.surface.configure(&self.device, &self.config);
                 return Ok(());
             }
-            wgpu::CurrentSurfaceTexture::Lost => {
-                anyhow::bail!("Lost device!");
-            }
+            wgpu::CurrentSurfaceTexture::Lost => anyhow::bail!("Lost device!"),
         };
         let view = output
             .texture
@@ -821,11 +1296,13 @@ impl State {
                 label: Some("Render Encoder"),
             });
 
+        // compute pass
         self.run_compute(&mut encoder);
 
+        // terrain render pass
         {
-            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("Render Pass"),
+            let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Terrain Render Pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &view,
                     resolve_target: None,
@@ -853,21 +1330,87 @@ impl State {
                 multiview_mask: None,
             });
 
-            render_pass.set_pipeline(&self.render_pipeline);
-            render_pass.set_bind_group(0, &self.diffuse_bind_group, &[]);
-            render_pass.set_bind_group(1, &self.camera_bind_group, &[]);
-            render_pass.set_bind_group(2, &self.terrain_bind_group, &[]);
-            render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
-            render_pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-            render_pass.draw_indexed(0..self.num_indices, 0, 0..1); // Only 1 instance for the terrain mesh
+            let (pipeline, terrain_bg) = match self.pipeline_mode {
+                PipelineMode::VertexShader => {
+                    (&self.vertex_gen_pipeline, &self.vertex_gen_bind_group)
+                }
+                _ => (&self.render_pipeline, &self.terrain_bind_group),
+            };
+
+            rpass.set_pipeline(pipeline);
+            rpass.set_bind_group(0, &self.camera_bind_group, &[]);
+            rpass.set_bind_group(1, terrain_bg, &[]);
+            rpass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
+            rpass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+            rpass.draw_indexed(0..self.num_indices, 0, 0..1);
         }
 
-        self.queue.submit(std::iter::once(encoder.finish()));
+        // egui render pass
+        // upload any new/changed font atlas textures.
+        for (id, delta) in &ui_output.textures_delta.set {
+            self.egui_renderer
+                .update_texture(&self.device, &self.queue, *id, delta);
+        }
+
+        let paint_jobs = egui_ctx.tessellate(ui_output.shapes, ui_output.pixels_per_point);
+        let screen_desc = egui_wgpu::ScreenDescriptor {
+            size_in_pixels: [self.config.width, self.config.height],
+            pixels_per_point: ui_output.pixels_per_point,
+        };
+
+        // update_buffers may produce extra CommandBuffers from render callbacks
+        // submit those before the main encoder to satisfy ordering requirements
+        let extra_cbs = self.egui_renderer.update_buffers(
+            &self.device,
+            &self.queue,
+            &mut encoder,
+            &paint_jobs,
+            &screen_desc,
+        );
+
+        {
+            let egui_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("egui Render Pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load, // draw on top of terrain
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None, // egui doesn't need depth
+                occlusion_query_set: None,
+                timestamp_writes: None,
+                multiview_mask: None,
+            });
+
+            // funky lifetime stuff, but it's fine - will just runtime error if there's an issue
+            let mut static_pass = egui_pass.forget_lifetime();
+            self.egui_renderer
+                .render(&mut static_pass, &paint_jobs, &screen_desc);
+        }
+
+        self.egui_winit_state
+            .handle_platform_output(&self.window, ui_output.platform_output);
+
+        // free any textures egui no longer needs
+        for id in &ui_output.textures_delta.free {
+            self.egui_renderer.free_texture(id);
+        }
+
+        // callback CBs first, then main encoder
+        let mut all_cbs: Vec<wgpu::CommandBuffer> = extra_cbs;
+        all_cbs.push(encoder.finish());
+        self.queue.submit(all_cbs);
         output.present();
 
         Ok(())
     }
 }
+
+// app boilerplate
 
 pub struct App {
     #[cfg(target_arch = "wasm32")]
@@ -947,9 +1490,11 @@ impl ApplicationHandler<State> for App {
         event: winit::event::WindowEvent,
     ) {
         let state = match &mut self.state {
-            Some(canvas) => canvas,
+            Some(s) => s,
             None => return,
         };
+
+        let egui_consumed = state.handle_egui_event(&event);
 
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
@@ -959,7 +1504,7 @@ impl ApplicationHandler<State> for App {
                 match state.render() {
                     Ok(_) => {}
                     Err(e) => {
-                        log::error!("Unable to render {e}");
+                        log::error!("Unable to render: {e}");
                         event_loop.exit();
                     }
                 }
@@ -972,7 +1517,9 @@ impl ApplicationHandler<State> for App {
                         ..
                     },
                 ..
-            } => state.handle_key(event_loop, code, key_state.is_pressed()),
+            } if !egui_consumed => {
+                state.handle_key(event_loop, code, key_state.is_pressed());
+            }
             _ => {}
         }
     }

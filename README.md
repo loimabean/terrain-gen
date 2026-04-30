@@ -1,5 +1,12 @@
 # CS 677 Final Project
 
-Very much WIP
+A procedural terrain generator using wgpu and wgsl. Runs both locally and in your browser using WebGPU.
 
-Currently up to the end of https://sotrh.github.io/learn-wgpu/beginner/tutorial2-surface/
+## Building & Running
+
+To build
+```sh
+cargo build
+```
+
+[Godot Terrain](https://github.com/GarrettGunnell/Godot-Terrain)

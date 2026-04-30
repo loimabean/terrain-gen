@@ -23,15 +23,24 @@ anyhow = "1.0"
 bytemuck = { version = "1.25", features = ["derive"] }
 cgmath = "0.18"
 env_logger = "0.11"
-image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 log = "0.4"
 pollster = "0.4"
 futures-intrusive = "0.5"
 web-time = "1.1"
 wgpu = "29.0"
-winit = { version = "0.30", features = ["android-native-activity"] }
+egui = "0.34.1"
+egui-wgpu = "0.34.1"
+# egui-winit is split into platform sections below because its default features
+# include `clipboard` (arboard) and `wayland`/`x11`, none of which compile on wasm32.
+winit = { version = "0.30.13", features = ["android-native-activity"] }
 
+# Native: full egui-winit with clipboard, Wayland, and X11 support.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+egui-winit = "0.34.1"
+
+# WASM: disable default features (clipboard/arboard, wayland, x11 don't exist on wasm32).
 [target.'cfg(target_arch = "wasm32")'.dependencies]
+egui-winit = { version = "0.34.1", default-features = false }
 console_error_panic_hook = "0.1"
 console_log = "1.0"
 wgpu = { version = "29.0", features = ["webgl"]}
@@ -44,7 +53,7 @@ web-sys = { version = "0.3", features = [
 ]}
 
 [dev-dependencies]
-criterion = { version = "0.5", features = ["html_reports"] }
+criterion = { version = "0.8", features = ["html_reports"] }
 
 [[bench]]
 name = "noise_bench"

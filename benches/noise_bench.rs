@@ -1,5 +1,6 @@
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use criterion::{Criterion, criterion_group, criterion_main};
 use cs677_final_project::noise::generate_perlin_grid;
+use std::hint::black_box;
 
 fn bench_noise_resolutions(c: &mut Criterion) {
     let mut group = c.benchmark_group("Perlin Noise CPU");
