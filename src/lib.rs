@@ -1,3 +1,4 @@
+pub mod noise;
 mod texture;
 
 use cgmath::{InnerSpace, SquareMatrix};
