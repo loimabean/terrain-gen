@@ -6,6 +6,8 @@ struct VertexInput {
 struct VertexOutput {
     @builtin(position) clip_position: vec4<f32>,
     @location(0) tex_coords: vec2<f32>,
+    @location(1) world_normal: vec3<f32>,
+    @location(2) world_position: vec3<f32>,
 };
 
 struct CameraUniform {
@@ -14,24 +16,43 @@ struct CameraUniform {
 @group(1) @binding(0)
 var<uniform> camera: CameraUniform;
 
-struct InstanceInput {
-    @location(5) model_matrix_0: vec4<f32>,
-    @location(6) model_matrix_1: vec4<f32>,
-    @location(7) model_matrix_2: vec4<f32>,
-    @location(8) model_matrix_3: vec4<f32>,
-}
+struct TerrainOptions {
+    width: u32,
+    height: u32,
+    scale: f32,
+    seed: u32,
+    octaves: u32,
+    persistence: f32,
+    lacunarity: f32,
+    _padding: u32,
+};
+
+// Terrain heightmap and normals from compute shader
+@group(2) @binding(0)
+var<storage, read> heightmap: array<vec4<f32>>;
+@group(2) @binding(1)
+var<uniform> options: TerrainOptions;
 
 @vertex
-fn vs_main(model: VertexInput, instance: InstanceInput) -> VertexOutput {
-    let model_matrix = mat4x4<f32>(
-        instance.model_matrix_0,
-        instance.model_matrix_1,
-        instance.model_matrix_2,
-        instance.model_matrix_3,
-    );
+fn vs_main(model: VertexInput) -> VertexOutput {
+    let x = u32(model.position.x);
+    let z = u32(model.position.z);
+    let index = z * options.width + x;
+
+    let height_data = heightmap[index];
+    let height = height_data.x;
+    let grad = height_data.yz;
+
+    // Construct normal from analytical gradients
+    let world_normal = normalize(vec3<f32>(-grad.x, 1.0, -grad.y));
+
     var out: VertexOutput;
     out.tex_coords = model.tex_coords;
-    out.clip_position = camera.view_proj * model_matrix * vec4<f32>(model.position, 1.0);
+
+    let world_pos = vec3<f32>(model.position.x, height * 20.0, model.position.z); // scale height for visibility
+    out.world_position = world_pos;
+    out.world_normal = world_normal;
+    out.clip_position = camera.view_proj * vec4<f32>(world_pos, 1.0);
     return out;
 }
 
@@ -42,5 +63,21 @@ var s_diffuse: sampler;
 
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
-    return textureSample(t_diffuse, s_diffuse, in.tex_coords);
+    let light_dir = normalize(vec3<f32>(1.0, 1.0, 1.0));
+    let diffuse_strength = max(dot(in.world_normal, light_dir), 0.0);
+    let ambient_strength = 0.2;
+
+    // Slope-based coloring
+    let slope = 1.0 - in.world_normal.y;
+    var color: vec3<f32>;
+    if (slope < 0.1) {
+        color = vec3<f32>(0.2, 0.8, 0.2); // Grass
+    } else if (slope < 0.4) {
+        color = vec3<f32>(0.5, 0.4, 0.3); // Dirt/Rock
+    } else {
+        color = vec3<f32>(0.9, 0.9, 1.0); // Snow
+    }
+
+    let lighting = diffuse_strength + ambient_strength;
+    return vec4<f32>(color * lighting, 1.0);
 }

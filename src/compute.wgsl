@@ -23,7 +23,7 @@ fn squirrel5(n: i32, seed: u32) -> u32 {
 }
 
 fn squirrel5_2d(x: i32, y: i32, seed: u32) -> u32 {
-    let n = x + (y* SQ5_PRIME1);
+    let n = x + (y * SQ5_PRIME1);
     return squirrel5(n, seed);
 }
 
@@ -31,8 +31,8 @@ fn fade(t: f32) -> f32 {
     return t * t * t * (t * (t * 6.0 - 15.0) + 10.0);
 }
 
-fn lerp(a: f32, b: f32, t: f32) -> f32 {
-    return a + t * (b - a);
+fn fade_derivative(t: f32) -> f32 {
+    return 30.0 * t * t * (t * (t - 2.0) + 1.0);
 }
 
 fn get_gradient(x: i32, y: i32, seed: u32) -> vec2<f32> {
@@ -42,7 +42,12 @@ fn get_gradient(x: i32, y: i32, seed: u32) -> vec2<f32> {
     return vec2<f32>(cos(angle), sin(angle));
 }
 
-fn perlin2d(pos: vec2<f32>, seed: u32) -> f32 {
+fn lerp_v(a: f32, b: f32, t: f32) -> f32 {
+    return a + t * (b - a);
+}
+
+// Returns vec3(value, grad_x, grad_y)
+fn perlin2d_grad(pos: vec2<f32>, seed: u32) -> vec3<f32> {
     let i = floor(pos);
     let f = pos - i;
 
@@ -51,22 +56,26 @@ fn perlin2d(pos: vec2<f32>, seed: u32) -> f32 {
 
     let u = fade(f.x);
     let v = fade(f.y);
+    let du = fade_derivative(f.x);
+    let dv = fade_derivative(f.y);
 
     let g00 = get_gradient(x_i, y_i, seed);
     let g10 = get_gradient(x_i + 1, y_i, seed);
     let g01 = get_gradient(x_i, y_i + 1, seed);
     let g11 = get_gradient(x_i + 1, y_i + 1, seed);
 
-    let n00 = dot(g00, f);
-    let n10 = dot(g10, f - vec2<f32>(1.0, 0.0));
-    let n01 = dot(g01, f - vec2<f32>(0.0, 1.0));
-    let n11 = dot(g11, f - vec2<f32>(1.0, 1.0));
+    let a = dot(g00, f);
+    let b = dot(g10, f - vec2<f32>(1.0, 0.0));
+    let c = dot(g01, f - vec2<f32>(0.0, 1.0));
+    let d = dot(g11, f - vec2<f32>(1.0, 1.0));
 
-    return lerp(
-        lerp(n00, n10, u),
-        lerp(n01, n11, u),
-        v
-    );
+    let val = a + u * (b - a) + v * (c - a) + u * v * (a - b - c + d);
+
+    let grad = g00 + u * (g10 - g00) + v * (g01 - g00) + u * v * (g00 - g10 - g01 + g11) +
+               vec2<f32>(du * (lerp_v(b - a, d - c, v)),
+        dv * (lerp_v(c - a, d - b, u)));
+
+    return vec3<f32>(val, grad);
 }
 
 struct ComputeUniforms {
@@ -74,10 +83,14 @@ struct ComputeUniforms {
     height: u32,
     scale: f32,
     seed: u32,
+    octaves: u32,
+    persistence: f32,
+    lacunarity: f32,
+    _padding: u32,
 };
 
 @group(0) @binding(0) var<uniform> uniforms: ComputeUniforms;
-@group(0) @binding(1) var<storage, read_write> output_buffer: array<f32>;
+@group(0) @binding(1) var<storage, read_write> output_buffer: array<vec4<f32>>;
 
 @compute @workgroup_size(16, 16)
 fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
@@ -85,11 +98,22 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
         return;
     }
 
-    let x = f32(global_id.x) * uniforms.scale;
-    let y = f32(global_id.y) * uniforms.scale;
+    let pos = vec2<f32>(f32(global_id.x), f32(global_id.y)) * uniforms.scale;
 
-    let noise_val = perlin2d(vec2<f32>(x, y), uniforms.seed);
+    var height = 0.0;
+    var grad = vec2<f32>(0.0);
+    var amplitude = 1.0;
+    var frequency = 1.0;
+
+    for (var i = 0u; i < uniforms.octaves; i = i + 1u) {
+        let n = perlin2d_grad(pos * frequency, uniforms.seed + i);
+        height = height + n.x * amplitude;
+        grad = grad + n.yz * amplitude * frequency;
+
+        amplitude = amplitude * uniforms.persistence;
+        frequency = frequency * uniforms.lacunarity;
+    }
 
     let index = global_id.y * uniforms.width + global_id.x;
-    output_buffer[index] = noise_val;
+    output_buffer[index] = vec4<f32>(height, grad.x, grad.y, 0.0);
 }

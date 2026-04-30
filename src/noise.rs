@@ -85,6 +85,27 @@ pub fn generate_perlin_grid(width: u32, height: u32, scale: f32, seed: u32) -> V
     grid
 }
 
+pub fn generate_fbm_grid(options: &crate::TerrainOptions) -> Vec<f32> {
+    let mut grid = Vec::with_capacity((options.width * options.height) as usize);
+    for y in 0..options.height {
+        for x in 0..options.width {
+            let mut val = 0.0;
+            let mut amplitude = 1.0;
+            let mut frequency = 1.0;
+            let nx = x as f32 * options.scale;
+            let ny = y as f32 * options.scale;
+
+            for i in 0..options.octaves {
+                val += perlin2d(nx * frequency, ny * frequency, options.seed + i) * amplitude;
+                amplitude *= options.persistence;
+                frequency *= options.lacunarity;
+            }
+            grid.push(val);
+        }
+    }
+    grid
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
