@@ -3,10 +3,9 @@ mod texture;
 
 use cgmath::{InnerSpace, SquareMatrix};
 use std::sync::Arc;
-use wgpu::{Color, util::DeviceExt};
+use wgpu::util::DeviceExt;
 use winit::{
     application::ApplicationHandler,
-    dpi::PhysicalPosition,
     event::*,
     event_loop::{ActiveEventLoop, EventLoop},
     keyboard::{KeyCode, PhysicalKey},
@@ -251,6 +250,26 @@ const INSTANCE_DISPLACEMENT: cgmath::Vector3<f32> = cgmath::Vector3::new(
     NUM_INSTANCES_PER_ROW as f32 * 0.5,
 );
 
+#[repr(C)]
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct TerrainOptions {
+    pub width: u32,
+    pub height: u32,
+    pub scale: f32,
+    pub seed: u32,
+}
+
+impl Default for TerrainOptions {
+    fn default() -> Self {
+        Self {
+            width: 1024,
+            height: 1024,
+            scale: 0.01,
+            seed: 42, // the answer to life, the universe, and everything
+        }
+    }
+}
+
 pub struct State {
     surface: wgpu::Surface<'static>,
     device: wgpu::Device,
@@ -272,7 +291,16 @@ pub struct State {
     instance_buffer: wgpu::Buffer,
     depth_texture: texture::Texture,
     window: Arc<Window>,
-    color: wgpu::Color,
+
+    // Terrain configuration
+    pub terrain_options: TerrainOptions,
+
+    // Compute resources
+    compute_pipeline: wgpu::ComputePipeline,
+    compute_bind_group: wgpu::BindGroup,
+    compute_uniform_buffer: wgpu::Buffer,
+    compute_output_buffer: wgpu::Buffer,
+    compute_read_buffer: wgpu::Buffer,
 }
 
 impl State {
@@ -515,13 +543,6 @@ impl State {
             cache: None,
         });
 
-        let color = wgpu::Color {
-            r: 0.5,
-            g: 0.5,
-            b: 0.5,
-            a: 1.0,
-        };
-
         let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Vertex Buffer"),
             contents: bytemuck::cast_slice(VERTICES),
@@ -534,6 +555,92 @@ impl State {
             usage: wgpu::BufferUsages::INDEX,
         });
         let num_indices = INDICES.len() as u32;
+
+        // compute pipeline
+        let compute_shader = device.create_shader_module(wgpu::include_wgsl!("compute.wgsl"));
+
+        let terrain_options = TerrainOptions::default();
+        let buffer_size = (terrain_options.width
+            * terrain_options.height
+            * std::mem::size_of::<f32>() as u32) as wgpu::BufferAddress;
+
+        let compute_output_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Compute Output Buffer"),
+            size: buffer_size,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+
+        let compute_read_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Compute Read Buffer"),
+            size: buffer_size,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+
+        let compute_uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Compute Uniform Buffer"),
+            contents: bytemuck::cast_slice(&[terrain_options]),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+
+        let compute_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("Compute Bind Group Layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
+            });
+
+        let compute_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Compute Bind Group"),
+            layout: &compute_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: compute_uniform_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: compute_output_buffer.as_entire_binding(),
+                },
+            ],
+        });
+
+        let compute_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("Compute Pipeline Layout"),
+                bind_group_layouts: &[Some(&compute_bind_group_layout)],
+                immediate_size: 0,
+            });
+
+        let compute_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("Compute Pipeline"),
+            layout: Some(&compute_pipeline_layout),
+            module: &compute_shader,
+            entry_point: Some("main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
 
         Ok(Self {
             surface,
@@ -556,7 +663,12 @@ impl State {
             instance_buffer,
             depth_texture,
             window,
-            color,
+            terrain_options,
+            compute_pipeline,
+            compute_bind_group,
+            compute_uniform_buffer,
+            compute_output_buffer,
+            compute_read_buffer,
         })
     }
 
@@ -575,6 +687,12 @@ impl State {
     fn handle_key(&mut self, event_loop: &ActiveEventLoop, code: KeyCode, is_pressed: bool) {
         match (code, is_pressed) {
             (KeyCode::Escape, true) => event_loop.exit(),
+            (KeyCode::KeyV, true) => {
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    pollster::block_on(self.verify_gpu()).unwrap();
+                }
+            }
             (KeyCode::F11, true) => match self.window.fullscreen() {
                 None => self
                     .window
@@ -586,17 +704,95 @@ impl State {
             }
         }
     }
-    fn handle_mouse_moved(&mut self, position: PhysicalPosition<f64>) {
-        if position.x >= 0.0 && position.y >= 0.0 {
-            self.color = Color {
-                r: position.x / self.config.width as f64,
-                g: ((position.x / self.config.width as f64)
-                    + (position.y / self.config.height as f64))
-                    / 2.0,
-                b: position.y / self.config.height as f64,
-                a: 1.0,
+
+    async fn execute_compute(&self) -> anyhow::Result<Vec<f32>> {
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("Compute Encoder"),
+            });
+
+        {
+            let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("Compute Pass"),
+                timestamp_writes: None,
+            });
+            compute_pass.set_pipeline(&self.compute_pipeline);
+            compute_pass.set_bind_group(0, &self.compute_bind_group, &[]);
+
+            let workgroup_count_x = self.terrain_options.width.div_ceil(16);
+            let workgroup_count_y = self.terrain_options.height.div_ceil(16);
+            compute_pass.dispatch_workgroups(workgroup_count_x, workgroup_count_y, 1);
+        }
+
+        let buffer_size =
+            (self.terrain_options.width * self.terrain_options.height * 4) as wgpu::BufferAddress;
+        encoder.copy_buffer_to_buffer(
+            &self.compute_output_buffer,
+            0,
+            &self.compute_read_buffer,
+            0,
+            buffer_size,
+        );
+
+        self.queue.submit(std::iter::once(encoder.finish()));
+
+        let buffer_slice = self.compute_read_buffer.slice(..);
+        let (sender, receiver) = futures_intrusive::channel::shared::oneshot_channel();
+        buffer_slice.map_async(wgpu::MapMode::Read, move |v| sender.send(v).unwrap());
+
+        self.device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .unwrap();
+
+        if let Some(Ok(())) = receiver.receive().await {
+            let data = buffer_slice.get_mapped_range();
+            let result = bytemuck::cast_slice(&data).to_vec();
+            drop(data);
+            self.compute_read_buffer.unmap();
+            Ok(result)
+        } else {
+            anyhow::bail!("Failed to read compute buffer")
+        }
+    }
+
+    pub async fn verify_gpu(&self) -> anyhow::Result<()> {
+        println!("Verifying GPU results against CPU baseline...");
+        let start_gpu = std::time::Instant::now();
+        let gpu_results = self.execute_compute().await?;
+        let gpu_duration = start_gpu.elapsed();
+
+        let start_cpu = std::time::Instant::now();
+        let cpu_results = noise::generate_perlin_grid(
+            self.terrain_options.width,
+            self.terrain_options.height,
+            self.terrain_options.scale,
+            self.terrain_options.seed,
+        );
+        let cpu_duration = start_cpu.elapsed();
+
+        println!("GPU Time: {:?}", gpu_duration);
+        println!("CPU Time: {:?}", cpu_duration);
+
+        let mut diff_count = 0;
+        for (i, (g, c)) in gpu_results.iter().zip(cpu_results.iter()).enumerate() {
+            if (g - c).abs() > 1e-3 {
+                if diff_count < 10 {
+                    let x = i as u32 % self.terrain_options.width;
+                    let y = i as u32 / self.terrain_options.width;
+                    println!("Difference at ({}, {}): GPU={}, CPU={}", x, y, g, c);
+                }
+                diff_count += 1;
             }
         }
+
+        if diff_count == 0 {
+            println!("SUCCESS: GPU results match CPU baseline!");
+        } else {
+            println!("FAILURE: {} differences found!", diff_count);
+        }
+
+        Ok(())
     }
 
     fn update(&mut self) {
@@ -654,7 +850,12 @@ impl State {
                     resolve_target: None,
                     depth_slice: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(self.color),
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: 0.2,
+                            g: 0.3,
+                            b: 0.5,
+                            a: 1.0,
+                        }),
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -790,7 +991,6 @@ impl ApplicationHandler<State> for App {
                     },
                 ..
             } => state.handle_key(event_loop, code, key_state.is_pressed()),
-            WindowEvent::CursorMoved { position, .. } => state.handle_mouse_moved(position),
             _ => {}
         }
     }
