@@ -43,12 +43,24 @@ fn lerp(a: f32, b: f32, t: f32) -> f32 {
 }
 
 fn get_gradient(x: i32, y: i32, seed: u32) -> Vector2<f32> {
-    // large prime used to offset the y-axis for 2D hashing
     let hash = squirrel5_2d(x, y, seed);
-
-    // Convert hash to angle in [0, 2PI]
     let angle = (hash as f32) * 2.0 * PI / (u32::MAX as f32);
     Vector2::new(angle.cos(), angle.sin())
+}
+
+// 256 evenly-spaced unit vectors
+pub fn build_gradient_lut() -> Vec<Vector2<f32>> {
+    (0u32..256)
+        .map(|i| {
+            let angle = (i as f32 / 256.0) * 2.0 * PI;
+            Vector2::new(angle.cos(), angle.sin())
+        })
+        .collect()
+}
+
+fn get_gradient_lut(x: i32, y: i32, seed: u32, lut: &[Vector2<f32>]) -> Vector2<f32> {
+    let hash = squirrel5_2d(x, y, seed);
+    lut[(hash & 255) as usize]
 }
 
 pub fn perlin2d(x: f32, y: f32, seed: u32) -> f32 {
@@ -104,6 +116,51 @@ pub fn generate_fbm_grid(options: &crate::TerrainOptions) -> Vec<f32> {
         }
     }
     grid
+}
+
+pub fn generate_fbm_grid_lut(options: &crate::TerrainOptions) -> Vec<f32> {
+    let lut = build_gradient_lut();
+    let mut grid = Vec::with_capacity((options.width * options.height) as usize);
+    for y in 0..options.height {
+        for x in 0..options.width {
+            let mut val = 0.0;
+            let mut amplitude = 1.0;
+            let mut frequency = 1.0;
+            let nx = x as f32 * options.scale;
+            let ny = y as f32 * options.scale;
+
+            for i in 0..options.octaves {
+                val += perlin2d_lut(nx * frequency, ny * frequency, options.seed + i, &lut)
+                    * amplitude;
+                amplitude *= options.persistence;
+                frequency *= options.lacunarity;
+            }
+            grid.push(val);
+        }
+    }
+    grid
+}
+
+fn perlin2d_lut(x: f32, y: f32, seed: u32, lut: &[Vector2<f32>]) -> f32 {
+    let x_i = x.floor() as i32;
+    let y_i = y.floor() as i32;
+    let x_f = x - x.floor();
+    let y_f = y - y.floor();
+
+    let u = fade(x_f);
+    let v = fade(y_f);
+
+    let g00 = get_gradient_lut(x_i, y_i, seed, lut);
+    let g10 = get_gradient_lut(x_i + 1, y_i, seed, lut);
+    let g01 = get_gradient_lut(x_i, y_i + 1, seed, lut);
+    let g11 = get_gradient_lut(x_i + 1, y_i + 1, seed, lut);
+
+    let n00 = g00.x * x_f + g00.y * y_f;
+    let n10 = g10.x * (x_f - 1.0) + g10.y * y_f;
+    let n01 = g01.x * x_f + g01.y * (y_f - 1.0);
+    let n11 = g11.x * (x_f - 1.0) + g11.y * (y_f - 1.0);
+
+    lerp(lerp(n00, n10, u), lerp(n01, n11, u), v)
 }
 
 #[cfg(test)]

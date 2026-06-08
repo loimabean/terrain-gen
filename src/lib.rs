@@ -105,6 +105,8 @@ pub enum PipelineMode {
     ComputeOptimized,
     /// Pipeline 3b - GPU compute replacing cos/sin with a 256-entry precomputed LUT.
     ComputeLut,
+    /// Pipeline 3c - LUT + all-octave shared-memory cache (single barrier, two loads/thread).
+    ComputeCombined,
     /// Pipeline 4 - terrain height computed entirely inside the vertex shader; no compute pass.
     VertexShader,
 }
@@ -115,6 +117,7 @@ impl PipelineMode {
             Self::ComputeStandard => "Compute - Standard",
             Self::ComputeOptimized => "Compute - Shared Mem",
             Self::ComputeLut => "Compute - Gradient LUT",
+            Self::ComputeCombined => "Compute - LUT + Shared Mem",
             Self::VertexShader => "Vertex Shader",
         }
     }
@@ -124,7 +127,8 @@ impl PipelineMode {
         match self {
             Self::ComputeStandard => Self::ComputeOptimized,
             Self::ComputeOptimized => Self::ComputeLut,
-            Self::ComputeLut => Self::VertexShader,
+            Self::ComputeLut => Self::ComputeCombined,
+            Self::ComputeCombined => Self::VertexShader,
             Self::VertexShader => Self::ComputeStandard,
         }
     }
@@ -162,6 +166,7 @@ pub struct State {
     compute_pipeline: wgpu::ComputePipeline, // standard
     optimized_compute_pipeline: wgpu::ComputePipeline, // shared-mem
     lut_compute_pipeline: wgpu::ComputePipeline, // gradient LUT
+    combined_compute_pipeline: wgpu::ComputePipeline, // LUT + all-octave shared mem
     compute_bind_group: wgpu::BindGroup,     // standard + optimized share this
     compute_lut_bind_group: wgpu::BindGroup, // LUT pipeline
     compute_uniform_buffer: wgpu::Buffer,
@@ -515,6 +520,18 @@ impl State {
                 cache: None,
             });
 
+        let combined_compute_shader =
+            device.create_shader_module(wgpu::include_wgsl!("compute_combined.wgsl"));
+        let combined_compute_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("Compute Pipeline (LUT + Shared Mem)"),
+                layout: Some(&lut_pipeline_layout),
+                module: &combined_compute_shader,
+                entry_point: Some("main"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+
         // terrain render resources (pipelines 2 & 3)
         let depth_texture =
             texture::Texture::create_depth_texture(&device, &config, "depth_texture");
@@ -741,6 +758,7 @@ impl State {
             compute_pipeline,
             optimized_compute_pipeline,
             lut_compute_pipeline,
+            combined_compute_pipeline,
             compute_bind_group,
             compute_lut_bind_group,
             compute_uniform_buffer,
@@ -788,20 +806,20 @@ impl State {
         self.terrain_options.height = new_height;
 
         let (vertices, indices) = create_plane_mesh(new_width, new_height);
-        self.vertex_buffer =
-            self.device
-                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("Vertex Buffer"),
-                    contents: bytemuck::cast_slice(&vertices),
-                    usage: wgpu::BufferUsages::VERTEX,
-                });
-        self.index_buffer =
-            self.device
-                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("Index Buffer"),
-                    contents: bytemuck::cast_slice(&indices),
-                    usage: wgpu::BufferUsages::INDEX,
-                });
+        self.vertex_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("Vertex Buffer"),
+                contents: bytemuck::cast_slice(&vertices),
+                usage: wgpu::BufferUsages::VERTEX,
+            });
+        self.index_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("Index Buffer"),
+                contents: bytemuck::cast_slice(&indices),
+                usage: wgpu::BufferUsages::INDEX,
+            });
         self.num_indices = indices.len() as u32;
 
         let buffer_size = (new_width * new_height * std::mem::size_of::<[f32; 4]>() as u32)
@@ -819,57 +837,54 @@ impl State {
             mapped_at_creation: false,
         });
 
-        self.compute_bind_group =
-            self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("Compute Bind Group"),
-                layout: &self.compute_bind_group_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: self.compute_uniform_buffer.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: self.compute_output_buffer.as_entire_binding(),
-                    },
-                ],
-            });
+        self.compute_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Compute Bind Group"),
+            layout: &self.compute_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: self.compute_uniform_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: self.compute_output_buffer.as_entire_binding(),
+                },
+            ],
+        });
 
-        self.compute_lut_bind_group =
-            self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("Compute LUT Bind Group"),
-                layout: &self.compute_lut_bind_group_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: self.compute_uniform_buffer.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: self.compute_output_buffer.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: self.gradient_lut_buffer.as_entire_binding(),
-                    },
-                ],
-            });
+        self.compute_lut_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Compute LUT Bind Group"),
+            layout: &self.compute_lut_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: self.compute_uniform_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: self.compute_output_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: self.gradient_lut_buffer.as_entire_binding(),
+                },
+            ],
+        });
 
-        self.terrain_bind_group =
-            self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                layout: &self.terrain_bind_group_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: self.compute_output_buffer.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: self.compute_uniform_buffer.as_entire_binding(),
-                    },
-                ],
-                label: Some("terrain_bind_group"),
-            });
+        self.terrain_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            layout: &self.terrain_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: self.compute_output_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: self.compute_uniform_buffer.as_entire_binding(),
+                },
+            ],
+            label: Some("terrain_bind_group"),
+        });
 
         // recenter the camera on the new grid
         let aspect = self.camera.aspect;
@@ -973,6 +988,10 @@ impl State {
                 (&self.optimized_compute_pipeline, &self.compute_bind_group)
             }
             PipelineMode::ComputeLut => (&self.lut_compute_pipeline, &self.compute_lut_bind_group),
+            PipelineMode::ComputeCombined => (
+                &self.combined_compute_pipeline,
+                &self.compute_lut_bind_group,
+            ),
             PipelineMode::VertexShader => return, // terrain generated inline in VS, no compute pass
         };
 
@@ -1048,7 +1067,12 @@ impl State {
         let gpu_ms = t_gpu.elapsed().as_secs_f64() * 1000.0;
 
         let t_cpu = web_time::Instant::now();
-        let cpu_results = crate::noise::generate_fbm_grid(&self.terrain_options);
+        let cpu_results = match self.pipeline_mode {
+            PipelineMode::ComputeLut | PipelineMode::ComputeCombined => {
+                crate::noise::generate_fbm_grid_lut(&self.terrain_options)
+            }
+            _ => crate::noise::generate_fbm_grid(&self.terrain_options),
+        };
         let cpu_ms = t_cpu.elapsed().as_secs_f64() * 1000.0;
 
         let mut diff_count = 0u32;
@@ -1185,6 +1209,7 @@ impl State {
                             (PipelineMode::ComputeStandard, "Compute - Standard"),
                             (PipelineMode::ComputeOptimized, "Compute - Shared Mem"),
                             (PipelineMode::ComputeLut, "Compute - Gradient LUT"),
+                            (PipelineMode::ComputeCombined, "Compute - LUT + Shared Mem"),
                             (PipelineMode::VertexShader, "Vertex Shader"),
                         ] {
                             ui.radio_value(mode, m, lbl);
@@ -1222,11 +1247,7 @@ impl State {
                             .selected_text(format!("{}x{}", selected, selected))
                             .show_ui(ui, |ui| {
                                 for &s in GRID_SIZES {
-                                    ui.selectable_value(
-                                        &mut selected,
-                                        s,
-                                        format!("{}x{}", s, s),
-                                    );
+                                    ui.selectable_value(&mut selected, s, format!("{}x{}", s, s));
                                 }
                             });
                         if selected != options.width {
@@ -1558,7 +1579,11 @@ impl ApplicationHandler<State> for App {
             } if !egui_consumed => {
                 state.handle_key(event_loop, code, key_state.is_pressed());
             }
-            WindowEvent::MouseInput { state: btn_state, button, .. } => {
+            WindowEvent::MouseInput {
+                state: btn_state,
+                button,
+                ..
+            } => {
                 state.handle_mouse_input(button, btn_state.is_pressed());
             }
             WindowEvent::MouseWheel { delta, .. } => {
@@ -1577,10 +1602,10 @@ impl ApplicationHandler<State> for App {
         _device_id: winit::event::DeviceId,
         event: DeviceEvent,
     ) {
-        if let Some(state) = &mut self.state {
-            if let DeviceEvent::MouseMotion { delta: (dx, dy) } = event {
-                state.handle_mouse_motion(dx, dy);
-            }
+        if let Some(state) = &mut self.state
+            && let DeviceEvent::MouseMotion { delta: (dx, dy) } = event
+        {
+            state.handle_mouse_motion(dx, dy);
         }
     }
 }
