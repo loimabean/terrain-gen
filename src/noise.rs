@@ -1,4 +1,4 @@
-use cgmath::Vector2;
+use glam::Vec2;
 use std::f32::consts::PI;
 
 // SquirrelNoise5 constants
@@ -42,23 +42,23 @@ fn lerp(a: f32, b: f32, t: f32) -> f32 {
     a + t * (b - a)
 }
 
-fn get_gradient(x: i32, y: i32, seed: u32) -> Vector2<f32> {
+fn get_gradient(x: i32, y: i32, seed: u32) -> Vec2 {
     let hash = squirrel5_2d(x, y, seed);
     let angle = (hash as f32) * 2.0 * PI / (u32::MAX as f32);
-    Vector2::new(angle.cos(), angle.sin())
+    Vec2::new(angle.cos(), angle.sin())
 }
 
 // 256 evenly-spaced unit vectors
-pub fn build_gradient_lut() -> Vec<Vector2<f32>> {
+pub fn build_gradient_lut() -> Vec<Vec2> {
     (0u32..256)
         .map(|i| {
             let angle = (i as f32 / 256.0) * 2.0 * PI;
-            Vector2::new(angle.cos(), angle.sin())
+            Vec2::new(angle.cos(), angle.sin())
         })
         .collect()
 }
 
-fn get_gradient_lut(x: i32, y: i32, seed: u32, lut: &[Vector2<f32>]) -> Vector2<f32> {
+fn get_gradient_lut(x: i32, y: i32, seed: u32, lut: &[Vec2]) -> Vec2 {
     let hash = squirrel5_2d(x, y, seed);
     lut[(hash & 255) as usize]
 }
@@ -141,7 +141,7 @@ pub fn generate_fbm_grid_lut(options: &crate::TerrainOptions) -> Vec<f32> {
     grid
 }
 
-fn perlin2d_lut(x: f32, y: f32, seed: u32, lut: &[Vector2<f32>]) -> f32 {
+fn perlin2d_lut(x: f32, y: f32, seed: u32, lut: &[Vec2]) -> f32 {
     let x_i = x.floor() as i32;
     let y_i = y.floor() as i32;
     let x_f = x - x.floor();

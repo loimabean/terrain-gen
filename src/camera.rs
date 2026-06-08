@@ -1,34 +1,27 @@
-use cgmath::{InnerSpace, SquareMatrix};
+use glam::{Mat4, Vec3};
 use winit::keyboard::KeyCode;
 
-const OPENGL_TO_WGPU_MATRIX: cgmath::Matrix4<f32> = cgmath::Matrix4::from_cols(
-    cgmath::Vector4::new(1.0, 0.0, 0.0, 0.0),
-    cgmath::Vector4::new(0.0, 1.0, 0.0, 0.0),
-    cgmath::Vector4::new(0.0, 0.0, 0.5, 0.0),
-    cgmath::Vector4::new(0.0, 0.0, 0.5, 1.0),
-);
-
 pub struct Camera {
-    pub position: cgmath::Point3<f32>,
+    pub position: Vec3,
     pub yaw: f32,   // radians, 0 = +x, pi/2 = +z
     pub pitch: f32, // radians, positive = up
     pub aspect: f32,
-    pub fovy: f32,
+    pub fovy: f32, // degrees
     pub znear: f32,
     pub zfar: f32,
 }
 
 impl Camera {
-    pub fn forward(&self) -> cgmath::Vector3<f32> {
+    pub fn forward(&self) -> Vec3 {
         let (sy, cy) = self.yaw.sin_cos();
         let (sp, cp) = self.pitch.sin_cos();
-        cgmath::Vector3::new(cy * cp, sp, sy * cp).normalize()
+        Vec3::new(cy * cp, sp, sy * cp).normalize()
     }
 
-    pub fn build_view_projection_matrix(&self) -> cgmath::Matrix4<f32> {
+    pub fn build_view_projection_matrix(&self) -> Mat4 {
         let target = self.position + self.forward();
-        let view = cgmath::Matrix4::look_at_rh(self.position, target, cgmath::Vector3::unit_y());
-        let proj = cgmath::perspective(cgmath::Deg(self.fovy), self.aspect, self.znear, self.zfar);
+        let view = Mat4::look_at_rh(self.position, target, Vec3::Y);
+        let proj = Mat4::perspective_rh(self.fovy.to_radians(), self.aspect, self.znear, self.zfar);
         proj * view
     }
 }
@@ -39,8 +32,8 @@ pub fn camera_for_grid(width: u32, height: u32, aspect: f32) -> Camera {
     let cz = height as f32 / 2.0;
     let eye_y = height as f32 * 0.29;
     let eye_z = height as f32 * 0.87;
-    let position = cgmath::Point3::new(cx, eye_y, eye_z);
-    let dir = cgmath::Point3::new(cx, 0.0, cz) - position;
+    let position = Vec3::new(cx, eye_y, eye_z);
+    let dir = Vec3::new(cx, 0.0, cz) - position;
     let yaw = dir.z.atan2(dir.x);
     let horiz = (dir.x * dir.x + dir.z * dir.z).sqrt();
     let pitch = dir.y.atan2(horiz);
@@ -58,18 +51,18 @@ pub fn camera_for_grid(width: u32, height: u32, aspect: f32) -> Camera {
 #[repr(C)]
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct CameraUniform {
-    pub view_proj: [[f32; 4]; 4],
+    pub view_proj: Mat4,
 }
 
 impl CameraUniform {
     pub fn new() -> Self {
         Self {
-            view_proj: cgmath::Matrix4::identity().into(),
+            view_proj: Mat4::IDENTITY,
         }
     }
 
     pub fn update_view_proj(&mut self, camera: &Camera) {
-        self.view_proj = (OPENGL_TO_WGPU_MATRIX * camera.build_view_projection_matrix()).into();
+        self.view_proj = camera.build_view_projection_matrix();
     }
 }
 
@@ -147,8 +140,8 @@ impl CameraController {
     pub fn update_camera(&mut self, camera: &mut Camera, dt: f32) {
         let (sin_yaw, cos_yaw) = camera.yaw.sin_cos();
         // Horizontal forward (xz plane) for WASD - pitch doesn't affect lateral movement.
-        let forward_h = cgmath::Vector3::new(cos_yaw, 0.0, sin_yaw);
-        let right = cgmath::Vector3::new(-sin_yaw, 0.0, cos_yaw);
+        let forward_h = Vec3::new(cos_yaw, 0.0, sin_yaw);
+        let right = Vec3::new(-sin_yaw, 0.0, cos_yaw);
 
         let move_speed = self.speed * dt;
         camera.position += forward_h * (self.amount_forward - self.amount_backward) * move_speed;
