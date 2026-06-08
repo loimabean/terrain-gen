@@ -1250,12 +1250,11 @@ impl State {
             let gpu_compute_time_ms = self.gpu_compute_time_ms;
             let verify_result = &self.verify_result;
 
-            egui_ctx.run_ui(raw_input, |ctx| {
+            egui_ctx.run_ui(raw_input, |ui| {
                 egui::Panel::left("terrain_controls")
                     .min_size(250.0)
                     .resizable(true)
-                    // TODO: resolve deprecation warning here
-                    .show(ctx, |ui| {
+                    .show_inside(ui, |ui| {
                         ui.heading("terrain gen!");
                         ui.separator();
 
@@ -1307,7 +1306,7 @@ impl State {
                                     .map(|ms| format!("{ms:.3} ms"))
                                     .unwrap_or_else(|| "...".to_string())
                             };
-                            ctx.copy_text(format!(
+                            ui.copy_text(format!(
                                 "Pipeline: {}\nGrid: {}x{}\nScale: {:.4}  Octaves: {}  Persistence: {:.2}  Lacunarity: {:.2}  Seed: {}\nFPS: {:.1} ({:.2} ms/frame)\nGPU compute: {}",
                                 mode.label(),
                                 options.width, options.height,
