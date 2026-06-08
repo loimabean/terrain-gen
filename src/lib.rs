@@ -195,6 +195,15 @@ pub struct State {
     egui_renderer: egui_wgpu::Renderer,
     egui_winit_state: egui_winit::State,
 
+    // GPU timestamp queries
+    timestamp_query_set: Option<wgpu::QuerySet>,
+    timestamp_resolve_buffer: Option<wgpu::Buffer>,
+    timestamp_read_buffer: Option<wgpu::Buffer>,
+    timestamp_period: f32,
+    pending_timestamp: Option<std::sync::mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>>,
+    gpu_compute_time_ms: Option<f32>,
+    gpu_compute_history: std::collections::VecDeque<f32>,
+
     // performance counters
     frame_timer: web_time::Instant,
     frame_time_ms: f32,
@@ -242,10 +251,16 @@ impl State {
             })
             .await?;
 
+        let has_timestamps = adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY);
+
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: None,
-                required_features: wgpu::Features::empty(),
+                required_features: if has_timestamps {
+                    wgpu::Features::TIMESTAMP_QUERY
+                } else {
+                    wgpu::Features::empty()
+                },
                 experimental_features: wgpu::ExperimentalFeatures::disabled(),
                 required_limits: if cfg!(target_arch = "wasm32") {
                     wgpu::Limits {
@@ -281,6 +296,31 @@ impl State {
             view_formats: vec![],
             desired_maximum_frame_latency: 2,
         };
+
+        let timestamp_period = queue.get_timestamp_period();
+        let (timestamp_query_set, timestamp_resolve_buffer, timestamp_read_buffer) =
+            if has_timestamps {
+                let qs = device.create_query_set(&wgpu::QuerySetDescriptor {
+                    label: Some("Timestamp Query Set"),
+                    ty: wgpu::QueryType::Timestamp,
+                    count: 2,
+                });
+                let resolve_buf = device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("Timestamp Resolve Buffer"),
+                    size: 16,
+                    usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
+                    mapped_at_creation: false,
+                });
+                let read_buf = device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("Timestamp Read Buffer"),
+                    size: 16,
+                    usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                    mapped_at_creation: false,
+                });
+                (Some(qs), Some(resolve_buf), Some(read_buf))
+            } else {
+                (None, None, None)
+            };
 
         let terrain_options_tmp = TerrainOptions::default();
         let mut camera = camera_for_grid(
@@ -776,6 +816,13 @@ impl State {
             egui_ctx,
             egui_renderer,
             egui_winit_state,
+            timestamp_query_set,
+            timestamp_resolve_buffer,
+            timestamp_read_buffer,
+            timestamp_period,
+            pending_timestamp: None,
+            gpu_compute_time_ms: None,
+            gpu_compute_history: std::collections::VecDeque::with_capacity(256),
             frame_timer: web_time::Instant::now(),
             frame_time_ms: 0.0,
             fps: 0.0,
@@ -995,9 +1042,17 @@ impl State {
             PipelineMode::VertexShader => return, // terrain generated inline in VS, no compute pass
         };
 
+        let ts_writes =
+            self.timestamp_query_set
+                .as_ref()
+                .map(|qs| wgpu::ComputePassTimestampWrites {
+                    query_set: qs,
+                    beginning_of_pass_write_index: Some(0),
+                    end_of_pass_write_index: Some(1),
+                });
         let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("Compute Pass"),
-            timestamp_writes: None,
+            timestamp_writes: ts_writes,
         });
         compute_pass.set_pipeline(pipeline);
         compute_pass.set_bind_group(0, bind_group, &[]);
@@ -1082,7 +1137,8 @@ impl State {
                 if diff_count < 5 {
                     let x = i as u32 % self.terrain_options.width;
                     let y = i as u32 / self.terrain_options.width;
-                    diff_lines.push_str(&format!("diff at ({x},{y}) gpu={:.5} cpu={:.5}\n", g[0], c));
+                    diff_lines
+                        .push_str(&format!("diff at ({x},{y}) gpu={:.5} cpu={:.5}\n", g[0], c));
                     log::info!("diff at ({x},{y}): GPU={:.5}  CPU={:.5}", g[0], c);
                 }
                 diff_count += 1;
@@ -1120,7 +1176,7 @@ impl State {
         self.fps = if self.fps_history.is_empty() {
             0.0
         } else {
-            self.fps_history.iter().copied().sum::<f32>() / self.fps_history.len() as f32
+            self.fps_history.iter().sum::<f32>() / self.fps_history.len() as f32
         };
 
         // WASM: poll the async verification result slot
@@ -1128,6 +1184,37 @@ impl State {
         if let Ok(mut slot) = self.verify_result_slot.try_lock() {
             if let Some(result) = slot.take() {
                 self.verify_result = result;
+            }
+        }
+
+        // poll for completed GPU timestamp readback
+        let _ = self.device.poll(wgpu::PollType::Poll);
+        if let Some(rx) = self.pending_timestamp.take() {
+            match rx.try_recv() {
+                Ok(Ok(())) => {
+                    if let Some(read_buf) = &self.timestamp_read_buffer {
+                        let data = read_buf.slice(..).get_mapped_range();
+                        let ts: &[u64] = bytemuck::cast_slice(&data);
+                        let elapsed_ns =
+                            ts[1].wrapping_sub(ts[0]) as f64 * self.timestamp_period as f64;
+                        drop(data);
+                        read_buf.unmap();
+                        let new_ms = (elapsed_ns / 1_000_000.0) as f32;
+                        if self.gpu_compute_history.len() >= 256 {
+                            self.gpu_compute_history.pop_front();
+                        }
+                        self.gpu_compute_history.push_back(new_ms);
+                        self.gpu_compute_time_ms = Some(
+                            self.gpu_compute_history.iter().sum::<f32>()
+                                / self.gpu_compute_history.len() as f32,
+                        );
+                    }
+                }
+                Ok(Err(_)) => {}
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    self.pending_timestamp = Some(rx); // not ready yet
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {}
             }
         }
 
@@ -1160,6 +1247,7 @@ impl State {
 
             let fps = self.fps;
             let frame_time_ms = self.frame_time_ms;
+            let gpu_compute_time_ms = self.gpu_compute_time_ms;
             let verify_result = &self.verify_result;
 
             egui_ctx.run_ui(raw_input, |ctx| {
@@ -1200,6 +1288,35 @@ impl State {
                                 .weak(),
                             );
                         });
+                        ui.horizontal(|ui| {
+                            ui.label("GPU compute:");
+                            let t_str = if *mode == PipelineMode::VertexShader {
+                                "N/A".to_string()
+                            } else {
+                                gpu_compute_time_ms
+                                    .map(|ms| format!("{ms:.3} ms"))
+                                    .unwrap_or_else(|| "...".to_string())
+                            };
+                            ui.label(egui::RichText::new(t_str).monospace());
+                        });
+                        if ui.button("Copy stats").clicked() {
+                            let gpu_t = if *mode == PipelineMode::VertexShader {
+                                "N/A".to_string()
+                            } else {
+                                gpu_compute_time_ms
+                                    .map(|ms| format!("{ms:.3} ms"))
+                                    .unwrap_or_else(|| "...".to_string())
+                            };
+                            ctx.copy_text(format!(
+                                "Pipeline: {}\nGrid: {}x{}\nScale: {:.4}  Octaves: {}  Persistence: {:.2}  Lacunarity: {:.2}  Seed: {}\nFPS: {:.1} ({:.2} ms/frame)\nGPU compute: {}",
+                                mode.label(),
+                                options.width, options.height,
+                                options.scale, options.octaves,
+                                options.persistence, options.lacunarity, options.seed,
+                                fps, frame_time_ms,
+                                gpu_t,
+                            ));
+                        }
 
                         ui.separator();
 
@@ -1459,10 +1576,35 @@ impl State {
             self.egui_renderer.free_texture(id);
         }
 
+        // resolve timestamp queries into the read buffer (only when compute ran and no readback pending)
+        let mut should_map_timestamps = false;
+        if self.pipeline_mode != PipelineMode::VertexShader
+            && self.pending_timestamp.is_none()
+            && let (Some(qs), Some(resolve_buf), Some(read_buf)) = (
+                &self.timestamp_query_set,
+                &self.timestamp_resolve_buffer,
+                &self.timestamp_read_buffer,
+            )
+        {
+            encoder.resolve_query_set(qs, 0..2, resolve_buf, 0);
+            encoder.copy_buffer_to_buffer(resolve_buf, 0, read_buf, 0, 16);
+            should_map_timestamps = true;
+        }
+
         // callback CBs first, then main encoder
         let mut all_cbs: Vec<wgpu::CommandBuffer> = extra_cbs;
         all_cbs.push(encoder.finish());
         self.queue.submit(all_cbs);
+
+        // kick off async readback of the timestamp buffer
+        if should_map_timestamps && let Some(read_buf) = &self.timestamp_read_buffer {
+            let (tx, rx) = std::sync::mpsc::channel::<Result<(), wgpu::BufferAsyncError>>();
+            read_buf.slice(..).map_async(wgpu::MapMode::Read, move |r| {
+                let _ = tx.send(r);
+            });
+            self.pending_timestamp = Some(rx);
+        }
+
         output.present();
 
         Ok(())
