@@ -1635,7 +1635,7 @@ impl App {
 impl ApplicationHandler<State> for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         #[allow(unused_mut)]
-        let mut window_attributes = Window::default_attributes();
+        let mut window_attributes = Window::default_attributes().with_title("terrain gen!");
 
         #[cfg(target_arch = "wasm32")]
         {

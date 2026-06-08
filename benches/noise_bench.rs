@@ -1,5 +1,5 @@
 use criterion::{Criterion, criterion_group, criterion_main};
-use cs677_final_project::noise::generate_perlin_grid;
+use terrain_gen::noise::generate_perlin_grid;
 use std::hint::black_box;
 
 fn bench_noise_resolutions(c: &mut Criterion) {

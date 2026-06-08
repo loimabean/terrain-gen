@@ -1,6 +1,8 @@
-# CS 677 Final Project - Procedural Terrain Generation
+# terrain gen!
 
-This is a procedural terrain generator built using wgpu and wgsl. Runs both locally and in your browser using WebGPU.
+This is a procedural terrain generator and renderer built using wgpu and wgsl. Terrain is calculated using Perlin noise layers in a technique known as [fractional Brownian motion](https://en.wikipedia.org/wiki/Fractional_Brownian_motion), and the calculations are done on the GPU with various methods to choose from. Runs both locally and in your browser using WebGPU.
+
+Originally a final project for [CS 677 Parallel Programming for Many-core Processors](https://web.stevens.edu/catalog/archive/2024-2025/en/catalog/academic-catalog/courses/cs-computer-science/600/cs-677.html) at Stevens Institute of Technology.
 
 ## Prerequisites
 

@@ -1,4 +1,4 @@
-use cs677_final_project::run;
+use terrain_gen::run;
 
 fn main() {
     run().unwrap()
