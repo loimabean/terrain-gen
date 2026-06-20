@@ -223,6 +223,12 @@ pub struct State {
     // last known cursor position (used by handle_cursor_moved; look deltas come from DeviceEvent)
     cursor_pos: Option<winit::dpi::PhysicalPosition<f64>>,
 
+    // active touch points for gesture recognition
+    // 1 finger slide = look, 2 finger pinch = zoom
+    touches: Vec<(u64, winit::dpi::PhysicalPosition<f64>)>,
+    // distance between the two active touches on the previous pinch update
+    pinch_prev_dist: Option<f32>,
+
     // winit
     window: Arc<Window>,
 }
@@ -834,6 +840,8 @@ impl State {
             #[cfg(target_arch = "wasm32")]
             verify_result_slot: std::sync::Arc::new(std::sync::Mutex::new(None)),
             cursor_pos: None,
+            touches: Vec::new(),
+            pinch_prev_dist: None,
             window,
         })
     }
@@ -1025,6 +1033,58 @@ impl State {
         if self.camera_controller.mouse_look_active {
             self.camera_controller.rotate_horizontal += dx as f32;
             self.camera_controller.rotate_vertical += dy as f32;
+        }
+    }
+
+    fn pinch_dist(&self) -> Option<f32> {
+        if self.touches.len() != 2 {
+            return None;
+        }
+        let a = self.touches[0].1;
+        let b = self.touches[1].1;
+        Some((((a.x - b.x).powi(2) + (a.y - b.y).powi(2)) as f32).sqrt()) // distance
+    }
+
+    fn handle_touch(&mut self, touch: Touch) {
+        // pixels of finger separation per scroll unit
+        const PINCH_ZOOM_SCALE: f32 = 0.01;
+
+        match touch.phase {
+            TouchPhase::Started => {
+                self.touches.push((touch.id, touch.location));
+                self.pinch_prev_dist = self.pinch_dist();
+            }
+            TouchPhase::Ended | TouchPhase::Cancelled => {
+                self.touches.retain(|(id, _)| *id != touch.id);
+                self.pinch_prev_dist = self.pinch_dist();
+            }
+            TouchPhase::Moved => {
+                let Some(idx) = self.touches.iter().position(|(id, _)| *id == touch.id) else {
+                    return;
+                };
+                let prev = self.touches[idx].1;
+                self.touches[idx].1 = touch.location;
+
+                match self.touches.len() {
+                    // drag to look
+                    1 => {
+                        self.camera_controller.rotate_horizontal +=
+                            (touch.location.x - prev.x) as f32;
+                        self.camera_controller.rotate_vertical +=
+                            (touch.location.y - prev.y) as f32;
+                    }
+                    // pinch to zoom
+                    2 => {
+                        if let (Some(dist), Some(prev_dist)) =
+                            (self.pinch_dist(), self.pinch_prev_dist)
+                        {
+                            self.camera_controller.scroll += (dist - prev_dist) * PINCH_ZOOM_SCALE;
+                        }
+                        self.pinch_prev_dist = self.pinch_dist();
+                    }
+                    _ => {}
+                }
+            }
         }
     }
 
@@ -1431,6 +1491,8 @@ impl State {
                         ui.label(egui::RichText::new("Space/Shift - up/down").monospace());
                         ui.label(egui::RichText::new("RMB + drag  - look").monospace());
                         ui.label(egui::RichText::new("Scroll      - zoom").monospace());
+                        ui.label(egui::RichText::new("Drag finger - look").monospace());
+                        ui.label(egui::RichText::new("Pinch       - zoom").monospace());
                         ui.label(egui::RichText::new("O           - cycle pipeline").monospace());
                         ui.label(egui::RichText::new("V           - verify GPU").monospace());
                         ui.label(egui::RichText::new("F11/F       - fullscreen").monospace());
@@ -1740,6 +1802,9 @@ impl ApplicationHandler<State> for App {
                     }
                 }
             }
+            WindowEvent::CursorMoved { position, .. } => {
+                state.handle_cursor_moved(position);
+            }
             WindowEvent::KeyboardInput {
                 event:
                     KeyEvent {
@@ -1755,14 +1820,15 @@ impl ApplicationHandler<State> for App {
                 state: btn_state,
                 button,
                 ..
-            } => {
+            } if !egui_consumed => {
                 state.handle_mouse_input(button, btn_state.is_pressed());
             }
-            WindowEvent::MouseWheel { delta, .. } => {
+            WindowEvent::MouseWheel { delta, .. } if !egui_consumed => {
                 state.handle_mouse_wheel(delta);
             }
-            WindowEvent::CursorMoved { position, .. } => {
-                state.handle_cursor_moved(position);
+
+            WindowEvent::Touch(touch) if !egui_consumed => {
+                state.handle_touch(touch);
             }
             _ => {}
         }
