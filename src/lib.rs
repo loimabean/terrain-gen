@@ -194,6 +194,7 @@ pub struct State {
     egui_ctx: egui::Context,
     egui_renderer: egui_wgpu::Renderer,
     egui_winit_state: egui_winit::State,
+    controls_open: bool,
 
     // GPU timestamp queries
     timestamp_query_set: Option<wgpu::QuerySet>,
@@ -816,6 +817,7 @@ impl State {
             egui_ctx,
             egui_renderer,
             egui_winit_state,
+            controls_open: true,
             timestamp_query_set,
             timestamp_resolve_buffer,
             timestamp_read_buffer,
@@ -1244,6 +1246,7 @@ impl State {
             let mode = &mut self.pipeline_mode;
             let verify_req = &mut self.verify_requested;
             let grid_size_req = &mut self.pending_grid_size;
+            let controls_open = &mut self.controls_open;
 
             let fps = self.fps;
             let frame_time_ms = self.frame_time_ms;
@@ -1251,13 +1254,40 @@ impl State {
             let verify_result = &self.verify_result;
 
             egui_ctx.run_ui(raw_input, |ui| {
+                // don't cover entire view on narrow screens
+                let screen_w = ui.ctx().content_rect().width();
+                let max_w = screen_w * 0.85;
+                let min_w = 250.0_f32.min(max_w);
+
+                if !*controls_open {
+                    // floating button to open panel when hidden
+                    egui::Area::new(egui::Id::new("show_controls"))
+                        .anchor(egui::Align2::LEFT_TOP, egui::vec2(8.0, 8.0))
+                        .show(ui.ctx(), |ui| {
+                            if ui.button("controls").clicked() {
+                                *controls_open = true;
+                            }
+                        });
+                    return;
+                }
+
                 egui::Panel::left("terrain_controls")
-                    .min_size(250.0)
+                    .min_size(min_w)
+                    .max_size(max_w)
                     .resizable(true)
                     .show_inside(ui, |ui| {
-                        ui.heading("terrain gen!");
+                        ui.horizontal(|ui| {
+                            if ui.button("<").on_hover_text("hide controls").clicked() {
+                                *controls_open = false;
+                            }
+                            ui.heading("terrain gen!");
+                        });
                         ui.separator();
 
+                        // make panel scrollable
+                        egui::ScrollArea::vertical()
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
                         // perf
                         ui.label(egui::RichText::new("Performance").strong());
                         let fps_color = if fps >= 55.0 {
@@ -1405,6 +1435,7 @@ impl State {
                         ui.label(egui::RichText::new("V           - verify GPU").monospace());
                         ui.label(egui::RichText::new("F11/F       - fullscreen").monospace());
                         ui.label(egui::RichText::new("Esc         - quit").monospace());
+                            });
                     });
             })
         };
